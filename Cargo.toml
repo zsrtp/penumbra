@@ -1,0 +1,18 @@
+[package]
+name = "penumbra"
+version = "0.1.0"
+edition = "2024"
+
+[[example]]
+name = "net_test"
+path = "examples/net_test.rs"
+
+[dev-dependencies]
+running-average = "0.1.0"
+
+[dependencies]
+gdb-client = { path = "./gdb-client" }
+clap = { version = "4.5.60", features = ["derive"] }
+eframe = "0.33.3"
+egui = { version = "0.33.3", features = [] }
+flume = "0.12.0"
