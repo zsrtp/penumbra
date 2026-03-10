@@ -205,7 +205,10 @@ pub fn run_dap_server(
                     .unwrap_or("?");
                 let count = args.breakpoints.as_ref().map(|b| b.len()).unwrap_or(0);
                 server.send_event(output_event(&format!(
-                    "SetBreakpoints: {} breakpoints in {:?}", count, file
+                    "SetBreakpoints: {} breakpoints in {:?} (path={:?}, name={:?})",
+                    count, file,
+                    args.source.path.as_deref(),
+                    args.source.name.as_deref(),
                 )))?;
                 let breakpoints = adapter.handle_set_breakpoints(
                     &args.source,
