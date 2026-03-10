@@ -178,9 +178,12 @@ pub fn run_dap_server(
                 match adapter.handle_attach(&merged) {
                     Ok(()) => {
                         no_ack.store(adapter.gdb.is_no_ack_mode(), Ordering::SeqCst);
+                        let di_path = merged.get("debugInfo").and_then(|v| v.as_str());
                         server.send_event(output_event(&format!(
-                            "Connected (no-ack mode: {})",
-                            adapter.gdb.is_no_ack_mode()
+                            "Connected (no-ack: {}, debugInfo: {:?}, project_root: {:?})",
+                            adapter.gdb.is_no_ack_mode(),
+                            di_path,
+                            merged.get("program").and_then(|v| v.as_str()),
                         )))?;
 
                         // Diagnostic: verify SHM state and exception handlers

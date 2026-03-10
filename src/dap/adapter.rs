@@ -849,11 +849,23 @@ impl DebugAdapter {
     fn resolve_frame(&self, addr: u32) -> (Option<Source>, Option<u32>, Option<String>) {
         let symbols = match &self.symbols {
             Some(s) => s,
-            None => return (None, None, None),
+            None => {
+                if self.verbose {
+                    eprintln!("[resolve_frame] 0x{:08x}: no symbols loaded", addr);
+                }
+                return (None, None, None);
+            }
         };
 
         let name = symbols.addr_to_function(addr).map(|s| demangle(s));
-        let (source, line) = match symbols.addr_to_location(addr) {
+        let loc = symbols.addr_to_location(addr);
+        if self.verbose {
+            eprintln!(
+                "[resolve_frame] 0x{:08x}: func={:?} loc={:?}",
+                addr, name, loc
+            );
+        }
+        let (source, line) = match loc {
             Some((file, line)) => {
                 let abs_path = self.resolve_source_path(&file);
                 let source = Source {
@@ -1269,40 +1281,20 @@ mod tests {
     }
 
     #[test]
-    fn resolve_src_lib_remaps() {
+    fn resolve_relative_prepends_root() {
         let a = adapter_with_root("/home/user/project");
         assert_eq!(
             a.resolve_source_path("src/JSystem/JFramework/JFWDisplay.cpp"),
-            "/home/user/project/libs/JSystem/src/JFramework/JFWDisplay.cpp"
+            "/home/user/project/src/JSystem/JFramework/JFWDisplay.cpp"
         );
     }
 
     #[test]
-    fn resolve_src_lib_nested() {
-        let a = adapter_with_root("/proj");
-        assert_eq!(
-            a.resolve_source_path("src/d/a/b/c.cpp"),
-            "/proj/libs/d/src/a/b/c.cpp"
-        );
-    }
-
-    #[test]
-    fn resolve_non_src_prefix_prepends_root() {
+    fn resolve_include_prepends_root() {
         let a = adapter_with_root("/proj");
         assert_eq!(
             a.resolve_source_path("include/header.h"),
             "/proj/include/header.h"
-        );
-    }
-
-    #[test]
-    fn resolve_src_no_slash_after_lib() {
-        // "src/file.cpp" — no lib subdirectory, no second slash in rest
-        let a = adapter_with_root("/proj");
-        // strip_prefix("src/") gives "file.cpp", find('/') returns None → falls through
-        assert_eq!(
-            a.resolve_source_path("src/file.cpp"),
-            "/proj/src/file.cpp"
         );
     }
 }

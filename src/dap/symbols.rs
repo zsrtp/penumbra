@@ -84,12 +84,19 @@ impl SymbolResolver {
             }
         };
 
-        Ok(Self {
+        let resolver = Self {
             symbols,
             context,
             dwarf,
             line_index,
-        })
+        };
+        eprintln!(
+            "SymbolResolver: {} symbols, {} line entries, context={}",
+            resolver.symbols.len(),
+            resolver.line_index.len(),
+            resolver.context.is_some(),
+        );
+        Ok(resolver)
     }
 
     fn load_dwarf(
@@ -482,9 +489,8 @@ mod tests {
 
     #[test]
     fn paths_match_partial_filename_no_match() {
-        // "oo.cpp" is a suffix of "foo.cpp" at the string level,
-        // so this actually returns true — documenting current behavior
-        assert!(paths_match("oo.cpp", "foo.cpp"));
+        // "oo.cpp" is a string suffix of "foo.cpp" but NOT a path suffix
+        assert!(!paths_match("oo.cpp", "foo.cpp"));
     }
 
     // ── addr_to_function ────────────────────────────────────────────────
