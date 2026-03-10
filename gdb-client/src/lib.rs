@@ -135,18 +135,23 @@ impl GDB {
         }
     }
 
-    /// Send Ctrl-C (0x03) interrupt and drain the two stop-reply packets
-    /// that the Dolphin/Nintendont stub sends.
+    /// Send Ctrl-C (0x03) interrupt and read the stop-reply.
     pub fn halt(&mut self) -> Result<StopReply, GDBError> {
         let stream = self.stream.as_mut().ok_or(GDBError::NotConnected)?;
         stream.write_all(&[0x03])?;
         stream.flush()?;
-        // The server sends two SIGTRAP stop-reply packets after 0x03:
-        // one from the UpdateCallback handler, and one from the CPU
-        // stepping handler in CPU.cpp. Drain both.
-        self.read_packet()?;
-        let reply = self.read_packet()?;
-        parse_stop_reply(&reply)
+        // Read the stop-reply. Some stubs send an extra packet (empty or
+        // duplicate); if the first packet isn't a valid stop-reply, try
+        // reading one more. Any leftover data is consumed by the next
+        // send_packet() call.
+        let first = self.read_packet()?;
+        match parse_stop_reply(&first) {
+            Ok(sr) => Ok(sr),
+            Err(_) => {
+                let second = self.read_packet()?;
+                parse_stop_reply(&second)
+            }
+        }
     }
 
     /// Send `c` (continue) without waiting for a stop reply.
