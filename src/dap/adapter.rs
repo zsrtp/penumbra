@@ -884,7 +884,13 @@ impl DebugAdapter {
             None => return dwarf_path.to_string(),
         };
 
-        format!("{}/{}", root, dwarf_path)
+        let joined = format!("{}/{}", root, dwarf_path);
+        // Normalize to OS path separators so VS Code can match to filesystem files
+        if cfg!(windows) {
+            joined.replace('/', "\\")
+        } else {
+            joined
+        }
     }
 }
 
