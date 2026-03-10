@@ -875,8 +875,6 @@ impl DebugAdapter {
     }
 
     /// Resolve a DWARF source path to an absolute filesystem path.
-    /// DWARF records paths like `src/JSystem/JFramework/JFWDisplay.cpp` but
-    /// the project tree uses `libs/JSystem/src/JFramework/JFWDisplay.cpp`.
     fn resolve_source_path(&self, dwarf_path: &str) -> String {
         if dwarf_path.starts_with('/') {
             return dwarf_path.to_string();
@@ -885,15 +883,6 @@ impl DebugAdapter {
             Some(r) => r,
             None => return dwarf_path.to_string(),
         };
-
-        // Remap src/<lib>/... → libs/<lib>/src/...
-        if let Some(rest) = dwarf_path.strip_prefix("src/") {
-            if let Some(slash) = rest.find('/') {
-                let lib_name = &rest[..slash];
-                let remainder = &rest[slash + 1..];
-                return format!("{}/libs/{}/src/{}", root, lib_name, remainder);
-            }
-        }
 
         format!("{}/{}", root, dwarf_path)
     }

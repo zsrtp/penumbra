@@ -627,5 +627,14 @@ pub(crate) fn paths_match(query: &str, dwarf_path: &str) -> bool {
     if q == d {
         return true;
     }
-    d.ends_with(&q) || q.ends_with(&d)
+    suffix_match(&q, &d) || suffix_match(&d, &q)
+}
+
+/// Check if `haystack` ends with `needle` at a path boundary (preceded by `/`).
+fn suffix_match(haystack: &str, needle: &str) -> bool {
+    if let Some(prefix) = haystack.strip_suffix(needle) {
+        prefix.is_empty() || prefix.ends_with('/')
+    } else {
+        false
+    }
 }
