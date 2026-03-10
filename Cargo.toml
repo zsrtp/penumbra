@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "gdb-client"]
+
 [package]
 name = "penumbra"
 version = "0.1.0"
@@ -16,3 +19,11 @@ clap = { version = "4.5.60", features = ["derive"] }
 eframe = "0.33.3"
 egui = { version = "0.33.3", features = [] }
 flume = "0.12.0"
+dap = "0.4.1-alpha1"
+object = "0.38.1"
+gimli = "0.33.0"
+addr2line = "0.26.0"
+memmap2 = "0.9.10"
+serde_json = "1.0.149"
+cwdemangle = "1"
+cpp_demangle = "0.4"
