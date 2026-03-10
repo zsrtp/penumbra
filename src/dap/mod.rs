@@ -126,9 +126,10 @@ pub fn run_dap_server(
     debug_info: Option<&str>,
     target: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let log_path = std::env::temp_dir().join("penumbra_dap_raw.log");
     let input = BufReader::new(TeeReader::new(
         std::io::stdin(),
-        fs::File::create("penumbra_dap_raw.log").ok(),
+        fs::File::create(&log_path).ok(),
     ));
     let output = BufWriter::new(std::io::stdout());
     let mut server = Server::new(input, output);
