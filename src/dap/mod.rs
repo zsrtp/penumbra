@@ -4,7 +4,6 @@ pub mod symbols;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::fs;
 
 use dap::events::{Event, OutputEventBody, StoppedEventBody};
 use dap::requests::Command;
@@ -13,28 +12,6 @@ use dap::server::{Server, ServerOutput};
 use dap::types::*;
 
 use self::adapter::DebugAdapter;
-
-struct TeeReader<R: Read> {
-    inner: R,
-    log: Option<fs::File>,
-}
-
-impl<R: Read> TeeReader<R> {
-    fn new(inner: R, log: Option<fs::File>) -> Self {
-        Self { inner, log }
-    }
-}
-
-impl<R: Read> Read for TeeReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let n = self.inner.read(buf)?;
-        if let Some(ref mut f) = self.log {
-            let _ = f.write_all(&buf[..n]);
-            let _ = f.flush();
-        }
-        Ok(n)
-    }
-}
 
 fn stopped_event(reason: StoppedEventReason) -> Event {
     Event::Stopped(StoppedEventBody {
@@ -126,11 +103,7 @@ pub fn run_dap_server(
     debug_info: Option<&str>,
     target: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let log_path = std::env::temp_dir().join("penumbra_dap_raw.log");
-    let input = BufReader::new(TeeReader::new(
-        std::io::stdin(),
-        fs::File::create(&log_path).ok(),
-    ));
+    let input = BufReader::new(std::io::stdin());
     let output = BufWriter::new(std::io::stdout());
     let mut server = Server::new(input, output);
     let server_output = server.output.clone();
