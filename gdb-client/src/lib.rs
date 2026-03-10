@@ -22,6 +22,9 @@ pub struct GDB {
     /// Set to true when the target is running (after `c`/`s`) and a monitor
     /// thread is reading from the cloned socket.  Prevents concurrent reads.
     target_running: Arc<AtomicBool>,
+    /// Original instructions saved for manual software breakpoints (Windows).
+    #[cfg(windows)]
+    saved_insns: std::collections::HashMap<u32, [u8; 4]>,
 }
 
 #[derive(Debug, Error)]
@@ -92,6 +95,8 @@ impl GDB {
             no_ack_mode: false,
             pending_stop_reply: None,
             target_running: Arc::new(AtomicBool::new(false)),
+            #[cfg(windows)]
+            saved_insns: std::collections::HashMap::new(),
         }
     }
 
@@ -294,29 +299,62 @@ impl GDB {
         parse_stop_reply(&reply)
     }
 
-    /// Send `Z0,<addr>,4` to set a software breakpoint.
+    /// Set a software breakpoint.
+    ///
+    /// On non-Windows: uses `Z0` (stub-managed breakpoints).
+    /// On Windows: writes a trap instruction directly into memory because
+    /// Dolphin's Windows GDB stub accepts `Z0` but doesn't act on it.
     pub fn set_breakpoint(&mut self, addr: u32) -> Result<(), GDBError> {
-        let cmd = format!("Z0,{:x},4", addr);
-        let reply = self.send_and_recv(cmd.as_bytes())?;
-        if reply == b"OK" {
+        #[cfg(not(windows))]
+        {
+            let cmd = format!("Z0,{:x},4", addr);
+            let reply = self.send_and_recv(cmd.as_bytes())?;
+            if reply == b"OK" {
+                Ok(())
+            } else {
+                Err(GDBError::InvalidResponse(
+                    String::from_utf8_lossy(&reply).into_owned(),
+                ))
+            }
+        }
+        #[cfg(windows)]
+        {
+            const TRAP: [u8; 4] = [0x7F, 0xE0, 0x00, 0x08];
+            if self.saved_insns.contains_key(&addr) {
+                return Ok(());
+            }
+            let orig = self.read_memory(addr, 4)?;
+            if orig.len() < 4 {
+                return Err(GDBError::InvalidResponse("short read for breakpoint".into()));
+            }
+            let mut saved = [0u8; 4];
+            saved.copy_from_slice(&orig[..4]);
+            self.write_memory(addr, &TRAP)?;
+            self.saved_insns.insert(addr, saved);
             Ok(())
-        } else {
-            Err(GDBError::InvalidResponse(
-                String::from_utf8_lossy(&reply).into_owned(),
-            ))
         }
     }
 
-    /// Send `z0,<addr>,4` to remove a software breakpoint.
+    /// Remove a software breakpoint.
     pub fn remove_breakpoint(&mut self, addr: u32) -> Result<(), GDBError> {
-        let cmd = format!("z0,{:x},4", addr);
-        let reply = self.send_and_recv(cmd.as_bytes())?;
-        if reply == b"OK" {
+        #[cfg(not(windows))]
+        {
+            let cmd = format!("z0,{:x},4", addr);
+            let reply = self.send_and_recv(cmd.as_bytes())?;
+            if reply == b"OK" {
+                Ok(())
+            } else {
+                Err(GDBError::InvalidResponse(
+                    String::from_utf8_lossy(&reply).into_owned(),
+                ))
+            }
+        }
+        #[cfg(windows)]
+        {
+            if let Some(saved) = self.saved_insns.remove(&addr) {
+                self.write_memory(addr, &saved)?;
+            }
             Ok(())
-        } else {
-            Err(GDBError::InvalidResponse(
-                String::from_utf8_lossy(&reply).into_owned(),
-            ))
         }
     }
 
