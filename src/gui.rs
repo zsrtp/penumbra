@@ -1,8 +1,9 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use flume::{Receiver, Sender};
-use gdb_client::{GDBCmd, GDBResponse, GDBSource, GDB};
+use gdb_client::{GDB, GDBCmd, GDBResponse, GDBSource};
 
 pub fn gdb_thread(app_to_gdb: Receiver<GDBCmd>, gdb_to_app: Sender<GDBResponse>) {
     let mut gdb = GDB::default();
@@ -120,9 +121,7 @@ pub fn gdb_thread(app_to_gdb: Receiver<GDBCmd>, gdb_to_app: Sender<GDBResponse>)
                     if packet.is_some() {
                         let _ = tx.send(GDBResponse::Halted);
                     } else {
-                        let _ = tx.send(GDBResponse::Error(
-                            "RSP monitor: connection lost".into(),
-                        ));
+                        let _ = tx.send(GDBResponse::Error("RSP monitor: connection lost".into()));
                     }
                 });
             }
@@ -146,11 +145,18 @@ pub fn run_gui(
         "Penumbra",
         options,
         Box::new(|_cc| {
+            let (ip, port) = if let Some(storage) = _cc.storage {
+                let ip = storage.get_string("RSPIpAddr").and_then(|string| std::net::Ipv4Addr::from_str(&string).ok()).map(|ip| ip.to_bits().to_be_bytes()).unwrap_or_default();
+                let port = storage.get_string("RSPPort").and_then(|string| u16::from_str(&string).ok()).unwrap_or(2159);
+                (ip, port)
+            } else {
+                ([0u8; 4], 2159)
+            };
             Ok(Box::new(PenumbraApp {
-                port: 2159,
+                port,
                 to_gdb: app_to_gdb,
                 from_gdb: gdb_to_app,
-                ip: Default::default(),
+                ip,
                 connexion: Default::default(),
                 running: false,
                 max_health: 0,
@@ -189,7 +195,7 @@ impl PenumbraApp {
 }
 
 impl eframe::App for PenumbraApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         // Process responses from GDB thread
         let mut got_response = false;
         for resp in self.from_gdb.try_iter() {
@@ -250,12 +256,26 @@ impl eframe::App for PenumbraApp {
             ui.add_enabled_ui(self.connexion == Connexion::Disconnected, |ui| {
                 ui.horizontal(|ui| {
                     let ip_label = ui.label("IP address: ");
+                    let ip_formated = format!(
+                        "{}.{}.{}.{}",
+                        self.ip[0], self.ip[1], self.ip[2], self.ip[3]
+                    );
                     for byte in self.ip.iter_mut() {
                         let field = ui.add(egui::DragValue::new(byte));
+                        if field.gained_focus() || field.lost_focus() || field.changed() {
+                            if let Some(storage) = frame.storage_mut() {
+                                storage.set_string("RSPIpAddr", ip_formated.clone());
+                            }
+                        }
                         field.labelled_by(ip_label.id);
                     }
                     ui.label(":");
-                    ui.add(egui::DragValue::new(&mut self.port));
+                    let port = ui.add(egui::DragValue::new(&mut self.port));
+                    if port.gained_focus() || port.lost_focus() || port.changed() {
+                        if let Some(storage) = frame.storage_mut() {
+                            storage.set_string("RSPPort", format!("{}", self.port));
+                        }
+                    }
                 });
             });
 
