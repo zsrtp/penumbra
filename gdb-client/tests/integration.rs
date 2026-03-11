@@ -1,10 +1,12 @@
-//! Integration tests for gdb-client against a real GDB stub (Nintendont on Wii).
+//! Integration tests for gdb-client against a real GDB stub.
 //!
-//! These tests require a running Wii with Nintendont at the address specified
-//! by the `GDB_TEST_HOST` env var (default: 192.168.1.100:2159).
+//! These tests require a running GDB stub at the address specified by
+//! `GDB_TEST_HOST`.  Set `GDB_TEST_TARGET` to `dolphin` or `nintendont`
+//! to enable/skip target-specific tests.
 //!
 //! Run with:
 //!   GDB_TEST_HOST=192.168.1.100:2159 \
+//!   GDB_TEST_TARGET=nintendont \
 //!   GDB_TEST_ELF=/path/to/game.elf \
 //!   GDB_TEST_BP_SYMBOL=fapGm_Execute__Fv \
 //!   cargo test --package gdb-client --test integration -- --ignored --test-threads=1
@@ -14,6 +16,38 @@
 use gdb_client::{GDBCmd, GDBSource, GDB};
 use std::net::IpAddr;
 use std::path::PathBuf;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Target {
+    Dolphin,
+    Nintendont,
+    Unknown,
+}
+
+fn target() -> Target {
+    match std::env::var("GDB_TEST_TARGET")
+        .unwrap_or_default()
+        .to_lowercase()
+        .as_str()
+    {
+        "dolphin" => Target::Dolphin,
+        "nintendont" | "nint" => Target::Nintendont,
+        _ => Target::Unknown,
+    }
+}
+
+/// Skip the test if the current target matches any of the listed targets.
+macro_rules! skip_on {
+    ($($t:expr),+ $(,)?) => {
+        let cur = target();
+        $(
+            if cur == $t {
+                eprintln!("SKIPPED: test not applicable to {:?}", cur);
+                return;
+            }
+        )+
+    };
+}
 
 fn test_target() -> Option<(IpAddr, u16)> {
     let host_port = std::env::var("GDB_TEST_HOST").ok()?;
@@ -78,6 +112,20 @@ fn connect_and_halt() {
     gdb.detach().expect("detach failed");
 }
 
+/// Test the consolidated connect_and_init() path (connect + ? + negotiate).
+#[test]
+#[ignore]
+fn connect_and_init() {
+    let (ip, port) = test_target().expect("GDB_TEST_HOST not set");
+    let mut gdb = GDB::new(GDBSource::Network((ip, port)));
+    gdb.execute_cmd(GDBCmd::ConnectAndInit)
+        .expect("connect_and_init failed");
+    assert!(gdb.is_no_ack_mode(), "no-ack mode should be active after init");
+    let regs = gdb.read_registers().expect("read regs failed");
+    assert!(regs.pc >= 0x80000000, "PC out of range: 0x{:08x}", regs.pc);
+    gdb.detach().expect("detach failed");
+}
+
 #[test]
 #[ignore]
 fn noack_mode() {
@@ -111,6 +159,27 @@ fn register_read_all() {
         "LR out of range: 0x{:08x}",
         regs.lr,
     );
+    gdb.detach().expect("detach failed");
+}
+
+/// Both Dolphin and Nintendont return a full register blob (GPRs + FPRs +
+/// specials) from the `g` command, though the exact size may vary slightly
+/// (Dolphin: 416 bytes, Nintendont: 412 bytes).
+#[test]
+#[ignore]
+fn register_blob_size() {
+    let mut gdb = connect_noack();
+    let regs = gdb.read_registers().expect("read_registers failed");
+    eprintln!("{:?} register blob size: {} bytes", target(), regs.reg_blob_size);
+    // Both stubs return at least GPRs + FPRs + specials (>= 392 bytes)
+    assert!(
+        regs.reg_blob_size >= 392,
+        "register blob too small: {} bytes (expected >= 392)",
+        regs.reg_blob_size,
+    );
+    // All special regs should be populated from the blob
+    assert!(regs.pc >= 0x80000000, "PC not populated: 0x{:08x}", regs.pc);
+    assert!(regs.lr >= 0x80000000, "LR not populated: 0x{:08x}", regs.lr);
     gdb.detach().expect("detach failed");
 }
 
@@ -244,6 +313,55 @@ fn breakpoint_remove_restores_instruction() {
     gdb.detach().expect("detach failed");
 }
 
+// ── Interrupt ───────────────────────────────────────────────────────────────
+
+/// Test send_interrupt(): resume the target, send 0x03, read stop-reply.
+#[test]
+#[ignore]
+fn interrupt_stops_running_target() {
+    let mut gdb = connect_noack();
+    gdb.resume().expect("resume failed");
+
+    // Give the target a moment to actually start running
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    gdb.send_interrupt().expect("send_interrupt failed");
+    let reply = gdb.wait_stop().expect("wait_stop after interrupt failed");
+    assert!(
+        reply.signal == 2 || reply.signal == 5,
+        "expected SIGINT(2) or SIGTRAP(5) after interrupt, got {}",
+        reply.signal,
+    );
+
+    // Should be able to read registers after interrupt
+    let regs = gdb.read_registers().expect("read regs after interrupt failed");
+    assert!(regs.pc >= 0x80000000, "PC out of range: 0x{:08x}", regs.pc);
+    gdb.detach().expect("detach failed");
+}
+
+/// Test interrupt + resume cycle multiple times.
+#[test]
+#[ignore]
+fn interrupt_resume_cycle() {
+    let mut gdb = connect_noack();
+
+    for i in 0..5 {
+        gdb.resume().expect(&format!("resume {} failed", i));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        gdb.send_interrupt().expect(&format!("interrupt {} failed", i));
+        let reply = gdb.wait_stop().expect(&format!("wait_stop {} failed", i));
+        assert!(
+            reply.signal == 2 || reply.signal == 5,
+            "iteration {}: unexpected signal {}",
+            i, reply.signal,
+        );
+        let regs = gdb.read_registers().expect(&format!("read regs {} failed", i));
+        assert!(regs.pc >= 0x80000000, "iter {}: PC out of range", i);
+    }
+
+    gdb.detach().expect("detach failed");
+}
+
 // ── Stack Walk ──────────────────────────────────────────────────────────────
 
 /// Walk PPC EABI back chain, returning (depth, terminated_cleanly).
@@ -302,49 +420,39 @@ fn stack_walk_after_breakpoint_continue() {
 
 // ── Monitor Pattern (Cloned Socket) ─────────────────────────────────────────
 
+/// Test the shared read_packet_from_stream() with the monitor pattern:
+/// resume target, read stop-reply on cloned socket, then use main socket.
 #[test]
 #[ignore]
 fn monitor_pattern_stack_walk() {
-    use std::io::Read as _;
-
     let mut gdb = connect_noack();
     let addr = bp_addr();
+    let no_ack = gdb.is_no_ack_mode();
     gdb.set_breakpoint(addr).expect("set BP failed");
 
     for i in 0..10 {
         gdb.resume().expect("resume failed");
 
-        // Read stop-reply from a cloned stream (simulates monitor thread)
-        let mut clone = gdb.try_clone_stream().expect("clone failed");
+        // Read stop-reply from a cloned stream using the shared function
+        let clone = gdb.try_clone_stream().expect("clone failed");
         clone
             .set_read_timeout(Some(std::time::Duration::from_secs(10)))
             .unwrap();
-
-        let mut byte = [0u8; 1];
-        loop {
-            clone.read_exact(&mut byte).expect("read $ failed");
-            if byte[0] == b'$' {
-                break;
-            }
-        }
-        let mut payload = Vec::new();
-        loop {
-            clone.read_exact(&mut byte).expect("read payload failed");
-            if byte[0] == b'#' {
-                break;
-            }
-            payload.push(byte[0]);
-        }
-        let mut csum = [0u8; 2];
-        clone.read_exact(&mut csum).expect("read csum failed");
+        let packet = gdb_client::read_packet_from_stream(&clone, no_ack);
         drop(clone);
 
+        let payload = packet.expect(&format!("iter {}: no packet received", i));
         assert!(
             payload.starts_with(b"T"),
             "iter {}: expected stop-reply, got {:?}",
             i,
             String::from_utf8_lossy(&payload[..payload.len().min(20)]),
         );
+
+        // Verify stop-reply parses correctly
+        let stop = gdb_client::parse_stop_reply(&payload)
+            .expect(&format!("iter {}: parse_stop_reply failed", i));
+        assert_eq!(stop.signal, 5, "iter {}: expected SIGTRAP", i);
 
         // Use main socket for reads (simulates DAP handler after monitor sets running=false)
         let regs = gdb.read_registers().expect(&format!("iter {}: read regs failed", i));
@@ -357,11 +465,57 @@ fn monitor_pattern_stack_walk() {
     gdb.detach().expect("detach failed");
 }
 
+/// Test the full GUI-style monitor pattern: resume, spawn monitor thread,
+/// send interrupt, monitor thread receives stop-reply.
+#[test]
+#[ignore]
+fn monitor_interrupt_pattern() {
+    let mut gdb = connect_noack();
+    let no_ack = gdb.is_no_ack_mode();
+
+    for i in 0..5 {
+        gdb.resume().expect(&format!("resume {} failed", i));
+
+        // Spawn a monitor thread (like gui.rs gdb_thread does)
+        let clone = gdb.try_clone_stream().expect("clone failed");
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
+        std::thread::spawn(move || {
+            let _ = clone.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+            if let Some(packet) = gdb_client::read_packet_from_stream(&clone, no_ack) {
+                let _ = tx.send(packet);
+            }
+        });
+
+        // Give target time to run, then interrupt
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        gdb.send_interrupt().expect(&format!("interrupt {} failed", i));
+
+        // Monitor thread should receive the stop-reply
+        let packet = rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect(&format!("iter {}: monitor didn't receive stop-reply", i));
+        assert!(
+            packet.starts_with(b"T") || packet.starts_with(b"S"),
+            "iter {}: expected stop-reply, got {:?}",
+            i,
+            String::from_utf8_lossy(&packet[..packet.len().min(20)]),
+        );
+
+        // Main socket should work for commands now
+        let regs = gdb.read_registers().expect(&format!("iter {}: read regs failed", i));
+        assert!(regs.pc >= 0x80000000, "iter {}: PC out of range", i);
+    }
+
+    gdb.detach().expect("detach failed");
+}
+
 // ── Single Step ─────────────────────────────────────────────────────────────
 
+/// Dolphin's `s` (single step) command is unreliable — it intermittently
+/// treats `s` as `c` (continue).  Skip on Dolphin.
 #[test]
 #[ignore]
 fn single_step_advances_pc() {
+    skip_on!(Target::Dolphin);
     let mut gdb = connect_noack();
     let regs = gdb.read_registers().expect("read regs failed");
     let orig_pc = regs.pc;
@@ -373,9 +527,12 @@ fn single_step_advances_pc() {
 
 // ── Reconnection ────────────────────────────────────────────────────────────
 
+/// Dolphin's GDB stub is single-use — it stops listening after the first
+/// connection detaches.  Skip on Dolphin.
 #[test]
 #[ignore]
 fn reconnect_rapid() {
+    skip_on!(Target::Dolphin);
     for _ in 0..5 {
         let mut gdb = connect_noack();
         let regs = gdb.read_registers().expect("read regs failed");

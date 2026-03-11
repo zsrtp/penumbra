@@ -1,15 +1,56 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use flume::{Receiver, Sender};
 use gdb_client::{GDBCmd, GDBResponse, GDBSource, GDB};
 
 pub fn gdb_thread(app_to_gdb: Receiver<GDBCmd>, gdb_to_app: Sender<GDBResponse>) {
     let mut gdb = GDB::default();
+    let target_running = Arc::new(AtomicBool::new(false));
+
     loop {
         match app_to_gdb.recv() {
             Ok(cmd) => {
+                let is_halt = matches!(cmd, GDBCmd::Halt);
+                let is_continue = matches!(cmd, GDBCmd::Continue);
+
+                if is_halt && target_running.load(Ordering::SeqCst) {
+                    // Target is running — just send 0x03 interrupt.
+                    // The monitor thread will read the stop-reply and send Halted.
+                    if let Err(e) = gdb.send_interrupt() {
+                        let _ = gdb_to_app.send(GDBResponse::Error(e.to_string()));
+                    }
+                    continue;
+                }
+
                 let response = match gdb.execute_cmd(cmd) {
                     Ok(resp) => resp,
                     Err(e) => GDBResponse::Error(e.to_string()),
                 };
+
+                if is_continue && matches!(response, GDBResponse::Continued) {
+                    // Target just resumed — spawn monitor thread for stop-reply.
+                    target_running.store(true, Ordering::SeqCst);
+                    if let Ok(stream) = gdb.try_clone_stream() {
+                        let tx = gdb_to_app.clone();
+                        let running = target_running.clone();
+                        let no_ack = gdb.is_no_ack_mode();
+                        std::thread::spawn(move || {
+                            let _ = stream.set_read_timeout(None);
+                            let packet =
+                                gdb_client::read_packet_from_stream(&stream, no_ack);
+                            running.store(false, Ordering::SeqCst);
+                            if packet.is_some() {
+                                let _ = tx.send(GDBResponse::Halted);
+                            } else {
+                                let _ = tx.send(GDBResponse::Error(
+                                    "RSP monitor: connection lost".into(),
+                                ));
+                            }
+                        });
+                    }
+                }
+
                 if gdb_to_app.send(response).is_err() {
                     return;
                 }
@@ -149,7 +190,7 @@ impl eframe::App for PenumbraApp {
                         self.ip[0], self.ip[1], self.ip[2], self.ip[3],
                     ));
                     self.send_cmd(GDBCmd::SetSource(GDBSource::Network((ip, self.port))), ctx);
-                    self.send_cmd(GDBCmd::Connect, ctx);
+                    self.send_cmd(GDBCmd::ConnectAndInit, ctx);
                 } else {
                     self.send_cmd(GDBCmd::Disconnect, ctx);
                 }

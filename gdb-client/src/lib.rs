@@ -48,6 +48,8 @@ pub enum GDBState {
 #[derive(Debug)]
 pub enum GDBCmd {
     Connect,
+    /// Connect + query_stop_reason + negotiate (full initialization).
+    ConnectAndInit,
     Halt,
     Continue,
     Disconnect,
@@ -114,6 +116,11 @@ impl GDB {
                     }
                 }
             }
+            GDBCmd::ConnectAndInit => {
+                self.execute_cmd(GDBCmd::Connect)?;
+                self.connect_and_init()?;
+                Ok(GDBResponse::Connected)
+            }
             GDBCmd::Halt => {
                 self.halt()?;
                 Ok(GDBResponse::Halted)
@@ -135,11 +142,17 @@ impl GDB {
         }
     }
 
-    /// Send Ctrl-C (0x03) interrupt and read the stop-reply.
-    pub fn halt(&mut self) -> Result<StopReply, GDBError> {
+    /// Send Ctrl-C (0x03) interrupt byte without reading a response.
+    pub fn send_interrupt(&mut self) -> Result<(), GDBError> {
         let stream = self.stream.as_mut().ok_or(GDBError::NotConnected)?;
         stream.write_all(&[0x03])?;
         stream.flush()?;
+        Ok(())
+    }
+
+    /// Send Ctrl-C (0x03) interrupt and read the stop-reply.
+    pub fn halt(&mut self) -> Result<StopReply, GDBError> {
+        self.send_interrupt()?;
         // Read the stop-reply. Some stubs send an extra packet (empty or
         // duplicate); if the first packet isn't a valid stop-reply, try
         // reading one more. Any leftover data is consumed by the next
@@ -355,6 +368,15 @@ impl GDB {
         Ok(())
     }
 
+    /// Full initialization: query_stop_reason + negotiate.
+    /// Call after connecting to perform the handshake that Nintendont requires
+    /// (the `?` packet installs the PPC exception handler).
+    pub fn connect_and_init(&mut self) -> Result<StopReply, GDBError> {
+        let stop = self.query_stop_reason()?;
+        self.negotiate()?;
+        Ok(stop)
+    }
+
     /// Block reading until a stop-reply packet arrives. Used when the target
     /// is running after `c` to detect breakpoint hits, exceptions, etc.
     pub fn wait_stop(&mut self) -> Result<StopReply, GDBError> {
@@ -366,11 +388,6 @@ impl GDB {
     pub fn try_clone_stream(&self) -> Result<TcpStream, GDBError> {
         let stream = self.stream.as_ref().ok_or(GDBError::NotConnected)?;
         stream.try_clone().map_err(GDBError::Disconnected)
-    }
-
-    /// Get a mutable reference to the underlying stream (for raw writes like Ctrl-C).
-    pub fn stream_mut(&mut self) -> Option<&mut TcpStream> {
-        self.stream.as_mut()
     }
 
     /// Whether no-ack mode was successfully negotiated.
@@ -430,46 +447,8 @@ impl GDB {
     /// Read a single RSP packet (`$...#xx`) from the stream, send `+` ACK, return the payload.
     fn read_packet(&mut self) -> Result<Vec<u8>, GDBError> {
         let stream = self.stream.as_mut().ok_or(GDBError::NotConnected)?;
-        let mut byte = [0u8; 1];
-
-        // Skip any leading ACK characters or junk until we see '$'
-        loop {
-            stream.read_exact(&mut byte)?;
-            if byte[0] == b'$' {
-                break;
-            }
-        }
-
-        // Read payload until '#', computing checksum
-        let mut payload = Vec::new();
-        let mut computed_csum: u8 = 0;
-        loop {
-            stream.read_exact(&mut byte)?;
-            if byte[0] == b'#' {
-                break;
-            }
-            payload.push(byte[0]);
-            computed_csum = computed_csum.wrapping_add(byte[0]);
-        }
-
-        // Read and validate 2-byte checksum
-        let mut csum_bytes = [0u8; 2];
-        stream.read_exact(&mut csum_bytes)?;
-        let received_csum = from_hex_digit(csum_bytes[0]) << 4 | from_hex_digit(csum_bytes[1]);
-        if received_csum != computed_csum {
-            eprintln!(
-                "RSP checksum mismatch: received {:02x}, computed {:02x}, payload len={}",
-                received_csum, computed_csum, payload.len()
-            );
-        }
-
-        // Send ACK (unless in no-ack mode)
-        if !self.no_ack_mode {
-            stream.write_all(b"+")?;
-            stream.flush()?;
-        }
-
-        Ok(payload)
+        read_packet_from_stream(stream, self.no_ack_mode)
+            .ok_or_else(|| GDBError::InvalidResponse("failed to read RSP packet".into()))
     }
 
     fn send_packet(&mut self, data: &[u8]) -> Result<(), GDBError> {
@@ -524,6 +503,63 @@ impl GDB {
     }
 }
 
+/// Read a single RSP packet ($payload#xx) from a raw TcpStream.
+/// Returns the payload bytes, or None on error/EOF.
+pub fn read_packet_from_stream(stream: &TcpStream, no_ack: bool) -> Option<Vec<u8>> {
+    let mut reader = stream;
+    let mut byte = [0u8; 1];
+
+    // Skip until '$', counting skipped bytes for diagnostics
+    let mut skipped = 0u32;
+    loop {
+        if reader.read_exact(&mut byte).is_err() {
+            return None;
+        }
+        if byte[0] == b'$' {
+            break;
+        }
+        skipped += 1;
+    }
+    if skipped > 0 {
+        eprintln!("RSP: skipped {} bytes before '$'", skipped);
+    }
+
+    // Read payload until '#', computing checksum
+    let mut payload = Vec::new();
+    let mut computed_csum: u8 = 0;
+    loop {
+        if reader.read_exact(&mut byte).is_err() {
+            return None;
+        }
+        if byte[0] == b'#' {
+            break;
+        }
+        payload.push(byte[0]);
+        computed_csum = computed_csum.wrapping_add(byte[0]);
+    }
+
+    // Read and validate 2-byte checksum
+    let mut csum_bytes = [0u8; 2];
+    if reader.read_exact(&mut csum_bytes).is_err() {
+        return None;
+    }
+    let received_csum = from_hex_digit(csum_bytes[0]) << 4 | from_hex_digit(csum_bytes[1]);
+    if received_csum != computed_csum {
+        eprintln!(
+            "RSP checksum mismatch: received {:02x}, computed {:02x}, payload len={}",
+            received_csum, computed_csum, payload.len()
+        );
+    }
+
+    // Send ACK only if not in no-ack mode
+    if !no_ack {
+        let _ = (&*stream).write_all(b"+");
+        let _ = (&*stream).flush();
+    }
+
+    Some(payload)
+}
+
 fn hex_digit(nibble: u8) -> u8 {
     match nibble {
         0..=9 => b'0' + nibble,
@@ -532,7 +568,7 @@ fn hex_digit(nibble: u8) -> u8 {
     }
 }
 
-fn from_hex_digit(c: u8) -> u8 {
+pub fn from_hex_digit(c: u8) -> u8 {
     match c {
         b'0'..=b'9' => c - b'0',
         b'a'..=b'f' => c - b'a' + 10,
@@ -552,7 +588,7 @@ fn decode_hex(hex: &str) -> Result<Vec<u8>, GDBError> {
     Ok(bytes)
 }
 
-fn parse_stop_reply(data: &[u8]) -> Result<StopReply, GDBError> {
+pub fn parse_stop_reply(data: &[u8]) -> Result<StopReply, GDBError> {
     let s = std::str::from_utf8(data)
         .map_err(|_| GDBError::InvalidResponse("non-utf8 stop reply".into()))?;
 

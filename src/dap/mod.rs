@@ -390,17 +390,10 @@ pub fn run_dap_server(
                 if adapter.verbose {
                     server.send_event(output_event("Sending interrupt (0x03)"))?;
                 }
-                match adapter.gdb.stream_mut() {
-                    Some(stream) => {
-                        if let Err(e) = stream.write_all(&[0x03]).and_then(|_| stream.flush()) {
-                            server.send_event(output_event(&format!(
-                                "Interrupt write failed: {}", e
-                            )))?;
-                        }
-                    }
-                    None => {
-                        server.send_event(output_event("No stream for interrupt"))?;
-                    }
+                if let Err(e) = adapter.gdb.send_interrupt() {
+                    server.send_event(output_event(&format!(
+                        "Interrupt write failed: {}", e
+                    )))?;
                 }
                 server.respond(req.success(ResponseBody::Pause))?;
             }
@@ -539,7 +532,7 @@ fn start_rsp_monitor<W: Write + Send + 'static>(
         let _ = stream.set_read_timeout(None);
         let skip_ack = no_ack.load(Ordering::SeqCst);
 
-        let packet = read_packet_from_stream(&stream, skip_ack);
+        let packet = gdb_client::read_packet_from_stream(&stream, skip_ack);
 
         // Clear the running flag FIRST so the main thread can resume sending.
         running.store(false, Ordering::SeqCst);
@@ -583,67 +576,3 @@ fn start_rsp_monitor<W: Write + Send + 'static>(
     });
 }
 
-/// Read a single RSP packet ($payload#xx) from a raw TcpStream.
-/// Returns the payload bytes, or None on error/EOF.
-fn read_packet_from_stream(stream: &std::net::TcpStream, no_ack: bool) -> Option<Vec<u8>> {
-    let mut reader = stream;
-    let mut byte = [0u8; 1];
-
-    // Skip until '$', counting skipped bytes for diagnostics
-    let mut skipped = 0u32;
-    loop {
-        if reader.read_exact(&mut byte).is_err() {
-            return None;
-        }
-        if byte[0] == b'$' {
-            break;
-        }
-        skipped += 1;
-    }
-    if skipped > 0 {
-        eprintln!("RSP monitor: skipped {} bytes before '$'", skipped);
-    }
-
-    // Read payload until '#', computing checksum
-    let mut payload = Vec::new();
-    let mut computed_csum: u8 = 0;
-    loop {
-        if reader.read_exact(&mut byte).is_err() {
-            return None;
-        }
-        if byte[0] == b'#' {
-            break;
-        }
-        payload.push(byte[0]);
-        computed_csum = computed_csum.wrapping_add(byte[0]);
-    }
-
-    // Read and validate 2-byte checksum
-    let mut csum_bytes = [0u8; 2];
-    if reader.read_exact(&mut csum_bytes).is_err() {
-        return None;
-    }
-    let from_hex = |c: u8| -> u8 {
-        match c {
-            b'0'..=b'9' => c - b'0',
-            b'a'..=b'f' => c - b'a' + 10,
-            b'A'..=b'F' => c - b'A' + 10,
-            _ => 0,
-        }
-    };
-    let received_csum = from_hex(csum_bytes[0]) << 4 | from_hex(csum_bytes[1]);
-    if received_csum != computed_csum {
-        eprintln!(
-            "RSP monitor: checksum mismatch! received={:02x} computed={:02x} len={}",
-            received_csum, computed_csum, payload.len()
-        );
-    }
-
-    // Send ACK only if not in no-ack mode
-    if !no_ack {
-        let _ = (&*stream).write_all(b"+");
-        let _ = (&*stream).flush();
-    }
-
-    Some(payload)
-}

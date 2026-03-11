@@ -93,21 +93,14 @@ impl DebugAdapter {
             .parse()
             .map_err(|e| format!("bad port: {}", e))?;
 
-        // Connect
+        // Connect + query_stop_reason + negotiate in one step.
+        // Nintendont defers installing the PPC exception handler (MAGIC/HALT_REQ)
+        // until '?' is received, so connect_and_init() must happen before
+        // setting breakpoints.
         self.gdb.source = Some(GDBSource::Network((ip, port)));
         self.gdb
-            .execute_cmd(gdb_client::GDBCmd::Connect)
+            .execute_cmd(gdb_client::GDBCmd::ConnectAndInit)
             .map_err(|e| e.to_string())?;
-
-        // Halt target — must happen before setting breakpoints.
-        // Nintendont defers installing the PPC exception handler (MAGIC/HALT_REQ)
-        // until '?' is received, so without this, trap instructions crash the game.
-        self.gdb
-            .query_stop_reason()
-            .map_err(|e| format!("initial halt failed: {}", e))?;
-
-        // Negotiate features (no-ack mode)
-        self.gdb.negotiate().map_err(|e| e.to_string())?;
 
         // Derive project root from program path (e.g. /path/to/project/build/GZ2E01/framework.elf → /path/to/project)
         let program_path = Path::new(program);
