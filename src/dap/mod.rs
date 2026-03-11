@@ -4,6 +4,7 @@ pub mod symbols;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use dap::events::{Event, OutputEventBody, StoppedEventBody};
 use dap::requests::Command;
@@ -110,8 +111,9 @@ pub fn run_dap_server(
 
     let mut adapter = DebugAdapter::new();
     let no_ack = Arc::new(AtomicBool::new(false));
+    let suppress_stop_event = Arc::new(AtomicBool::new(false));
 
-    loop {
+    'main: loop {
         let mut req = match server.poll_request()? {
             Some(r) => r,
             None => break,
@@ -190,6 +192,7 @@ pub fn run_dap_server(
                             &server_output,
                             &adapter.gdb.target_running_flag(),
                             &no_ack,
+                            &suppress_stop_event,
                             adapter.verbose,
                         );
                     }
@@ -213,6 +216,47 @@ pub fn run_dap_server(
                     args.source.path.as_deref(),
                     args.source.name.as_deref(),
                 )))?;
+
+                // If target is running, halt it transparently before setting breakpoints.
+                let was_running = needs_halt_for_breakpoints(&adapter.gdb.target_running_flag());
+                if was_running {
+                    if adapter.verbose {
+                        server.send_event(output_event(
+                            "SetBreakpoints: target running, halting transparently"
+                        ))?;
+                    }
+                    suppress_stop_event.store(true, Ordering::SeqCst);
+                    if let Err(e) = adapter.gdb.send_interrupt() {
+                        suppress_stop_event.store(false, Ordering::SeqCst);
+                        server.send_event(output_event(&format!(
+                            "SetBreakpoints: interrupt failed: {}", e
+                        )))?;
+                        server.respond(req.error(&format!("failed to halt target: {}", e)))?;
+                        continue;
+                    }
+                    // Spin-wait for the monitor thread to clear target_running.
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    while adapter.gdb.target_running_flag().load(Ordering::SeqCst) {
+                        if Instant::now() > deadline {
+                            suppress_stop_event.store(false, Ordering::SeqCst);
+                            server.send_event(output_event(
+                                "SetBreakpoints: timeout waiting for target to halt"
+                            ))?;
+                            server.respond(req.error("timeout waiting for target to halt"))?;
+                            continue 'main;
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    // Drain stale data now that the target is stopped.
+                    let _ = adapter.gdb.take_pending_stop_reply();
+                    let drained = adapter.gdb.drain_stale_data();
+                    if adapter.verbose && drained > 0 {
+                        server.send_event(output_event(&format!(
+                            "SetBreakpoints: drained {} stale bytes after halt", drained
+                        )))?;
+                    }
+                }
+
                 let breakpoints = adapter.handle_set_breakpoints(
                     &args.source,
                     &args.breakpoints.unwrap_or_default(),
@@ -257,14 +301,128 @@ pub fn run_dap_server(
                 server.respond(req.success(ResponseBody::SetBreakpoints(
                     SetBreakpointsResponse { breakpoints },
                 )))?;
+
+                // If we halted the target, resume it transparently.
+                if was_running {
+                    let _ = adapter.gdb.take_pending_stop_reply();
+                    let drained = adapter.gdb.drain_stale_data();
+                    if adapter.verbose && drained > 0 {
+                        server.send_event(output_event(&format!(
+                            "SetBreakpoints: drained {} stale bytes before resume", drained
+                        )))?;
+                    }
+                    match adapter.handle_continue() {
+                        Ok(()) => {
+                            if adapter.verbose {
+                                server.send_event(output_event(
+                                    "SetBreakpoints: target resumed after breakpoint update"
+                                ))?;
+                            }
+                            suppress_stop_event.store(false, Ordering::SeqCst);
+                            adapter.gdb.set_target_running(true);
+                            start_rsp_monitor(
+                                &adapter.gdb,
+                                &server_output,
+                                &adapter.gdb.target_running_flag(),
+                                &no_ack,
+                                &suppress_stop_event,
+                                adapter.verbose,
+                            );
+                        }
+                        Err(e) => {
+                            suppress_stop_event.store(false, Ordering::SeqCst);
+                            server.send_event(output_event(&format!(
+                                "SetBreakpoints: resume failed: {}", e
+                            )))?;
+                            // Target is now stopped — emit a Stopped event so the
+                            // UI reflects the actual state.
+                            server.send_event(stopped_event(StoppedEventReason::Breakpoint))?;
+                        }
+                    }
+                }
             }
 
             Command::SetFunctionBreakpoints(args) => {
+                // If target is running, halt it transparently.
+                let was_running = needs_halt_for_breakpoints(&adapter.gdb.target_running_flag());
+                if was_running {
+                    if adapter.verbose {
+                        server.send_event(output_event(
+                            "SetFunctionBreakpoints: target running, halting transparently"
+                        ))?;
+                    }
+                    suppress_stop_event.store(true, Ordering::SeqCst);
+                    if let Err(e) = adapter.gdb.send_interrupt() {
+                        suppress_stop_event.store(false, Ordering::SeqCst);
+                        server.send_event(output_event(&format!(
+                            "SetFunctionBreakpoints: interrupt failed: {}", e
+                        )))?;
+                        server.respond(req.error(&format!("failed to halt target: {}", e)))?;
+                        continue;
+                    }
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    while adapter.gdb.target_running_flag().load(Ordering::SeqCst) {
+                        if Instant::now() > deadline {
+                            suppress_stop_event.store(false, Ordering::SeqCst);
+                            server.send_event(output_event(
+                                "SetFunctionBreakpoints: timeout waiting for target to halt"
+                            ))?;
+                            server.respond(req.error("timeout waiting for target to halt"))?;
+                            continue 'main;
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    let _ = adapter.gdb.take_pending_stop_reply();
+                    let drained = adapter.gdb.drain_stale_data();
+                    if adapter.verbose && drained > 0 {
+                        server.send_event(output_event(&format!(
+                            "SetFunctionBreakpoints: drained {} stale bytes after halt", drained
+                        )))?;
+                    }
+                }
+
                 let breakpoints =
                     adapter.handle_set_function_breakpoints(&args.breakpoints);
                 server.respond(req.success(ResponseBody::SetFunctionBreakpoints(
                     SetFunctionBreakpointsResponse { breakpoints },
                 )))?;
+
+                // If we halted the target, resume it transparently.
+                if was_running {
+                    let _ = adapter.gdb.take_pending_stop_reply();
+                    let drained = adapter.gdb.drain_stale_data();
+                    if adapter.verbose && drained > 0 {
+                        server.send_event(output_event(&format!(
+                            "SetFunctionBreakpoints: drained {} stale bytes before resume", drained
+                        )))?;
+                    }
+                    match adapter.handle_continue() {
+                        Ok(()) => {
+                            if adapter.verbose {
+                                server.send_event(output_event(
+                                    "SetFunctionBreakpoints: target resumed after breakpoint update"
+                                ))?;
+                            }
+                            suppress_stop_event.store(false, Ordering::SeqCst);
+                            adapter.gdb.set_target_running(true);
+                            start_rsp_monitor(
+                                &adapter.gdb,
+                                &server_output,
+                                &adapter.gdb.target_running_flag(),
+                                &no_ack,
+                                &suppress_stop_event,
+                                adapter.verbose,
+                            );
+                        }
+                        Err(e) => {
+                            suppress_stop_event.store(false, Ordering::SeqCst);
+                            server.send_event(output_event(&format!(
+                                "SetFunctionBreakpoints: resume failed: {}", e
+                            )))?;
+                            server.send_event(stopped_event(StoppedEventReason::Breakpoint))?;
+                        }
+                    }
+                }
             }
 
             Command::SetExceptionBreakpoints(_) => {
@@ -374,6 +532,7 @@ pub fn run_dap_server(
                             &server_output,
                             &adapter.gdb.target_running_flag(),
                             &no_ack,
+                            &suppress_stop_event,
                             adapter.verbose,
                         );
                     }
@@ -473,6 +632,7 @@ pub fn run_dap_server(
                             &server_output,
                             &adapter.gdb.target_running_flag(),
                             &no_ack,
+                            &suppress_stop_event,
                             adapter.verbose,
                         );
                     }
@@ -512,11 +672,19 @@ pub fn run_dap_server(
 /// are NOT drained here.  Instead, `send_packet`'s ACK loop will consume
 /// them the next time a command is sent, and callers discard the stale
 /// `pending_stop_reply` before spawning this monitor.
+/// Returns `true` if the target needs to be halted before setting breakpoints.
+/// This checks the `target_running` atomic flag — when the target is already
+/// stopped we skip the halt entirely.
+fn needs_halt_for_breakpoints(target_running: &Arc<AtomicBool>) -> bool {
+    target_running.load(Ordering::SeqCst)
+}
+
 fn start_rsp_monitor<W: Write + Send + 'static>(
     gdb: &gdb_client::GDB,
     output: &Arc<Mutex<ServerOutput<W>>>,
     target_running: &Arc<AtomicBool>,
     no_ack: &Arc<AtomicBool>,
+    suppress_stop: &Arc<AtomicBool>,
     verbose: bool,
 ) {
     let stream = match gdb.try_clone_stream() {
@@ -526,6 +694,7 @@ fn start_rsp_monitor<W: Write + Send + 'static>(
     let output = output.clone();
     let running = target_running.clone();
     let no_ack = no_ack.clone();
+    let suppress_stop = suppress_stop.clone();
 
     std::thread::spawn(move || {
         // Blocking mode — wait for the one stop-reply we expect.
@@ -536,6 +705,11 @@ fn start_rsp_monitor<W: Write + Send + 'static>(
 
         // Clear the running flag FIRST so the main thread can resume sending.
         running.store(false, Ordering::SeqCst);
+
+        // If suppressed, skip emitting events (transparent halt for breakpoint setting).
+        if suppress_stop.load(Ordering::SeqCst) {
+            return;
+        }
 
         match packet {
             Some(packet) => {
@@ -576,3 +750,63 @@ fn start_rsp_monitor<W: Write + Send + 'static>(
     });
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn needs_halt_when_target_running() {
+        let flag = Arc::new(AtomicBool::new(true));
+        assert!(needs_halt_for_breakpoints(&flag));
+    }
+
+    #[test]
+    fn no_halt_when_target_stopped() {
+        let flag = Arc::new(AtomicBool::new(false));
+        assert!(!needs_halt_for_breakpoints(&flag));
+    }
+
+    #[test]
+    fn suppress_stop_event_flag_lifecycle() {
+        // Simulates the lifecycle: set before interrupt, cleared after resume.
+        let suppress = Arc::new(AtomicBool::new(false));
+        let target_running = Arc::new(AtomicBool::new(true));
+
+        // Before halt: suppress is false.
+        assert!(!suppress.load(Ordering::SeqCst));
+
+        // Set suppress before sending interrupt.
+        suppress.store(true, Ordering::SeqCst);
+        assert!(suppress.load(Ordering::SeqCst));
+
+        // Simulate monitor thread clearing target_running (but NOT emitting
+        // Stopped event because suppress is true).
+        target_running.store(false, Ordering::SeqCst);
+        assert!(suppress.load(Ordering::SeqCst)); // still suppressed
+
+        // After resume: clear suppress.
+        suppress.store(false, Ordering::SeqCst);
+        assert!(!suppress.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn suppress_cleared_on_interrupt_failure() {
+        // If interrupt fails, suppress must be cleared to avoid leaking state.
+        let suppress = Arc::new(AtomicBool::new(false));
+        suppress.store(true, Ordering::SeqCst);
+
+        // Simulate interrupt failure — must clear suppress.
+        suppress.store(false, Ordering::SeqCst);
+        assert!(!suppress.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn suppress_cleared_on_timeout() {
+        // If halt times out, suppress must be cleared.
+        let suppress = Arc::new(AtomicBool::new(true));
+
+        // Simulate timeout — must clear suppress.
+        suppress.store(false, Ordering::SeqCst);
+        assert!(!suppress.load(Ordering::SeqCst));
+    }
+}

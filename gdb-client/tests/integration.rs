@@ -508,6 +508,157 @@ fn monitor_interrupt_pattern() {
     gdb.detach().expect("detach failed");
 }
 
+// ── Halt-for-Breakpoints (set BP while running) ─────────────────────────────
+
+/// Simulate the DAP "set breakpoint while target is running" pattern:
+/// resume → interrupt → wait for stop → set breakpoint → resume → hit BP.
+///
+/// This is the core flow that `SetBreakpoints` uses when the target is running.
+#[test]
+#[ignore]
+fn set_breakpoint_while_running() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let mut gdb = connect_noack();
+    let addr = bp_addr();
+    let no_ack = gdb.is_no_ack_mode();
+    let target_running = Arc::new(AtomicBool::new(false));
+
+    // Resume the target (simulates ConfigurationDone/Continue)
+    gdb.resume().expect("initial resume failed");
+    target_running.store(true, Ordering::SeqCst);
+
+    // Spawn a monitor thread (same pattern as start_rsp_monitor)
+    let clone = gdb.try_clone_stream().expect("clone failed");
+    let running = target_running.clone();
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
+    std::thread::spawn(move || {
+        let _ = clone.set_read_timeout(None);
+        if let Some(packet) = gdb_client::read_packet_from_stream(&clone, no_ack) {
+            // Clear running flag FIRST (same as start_rsp_monitor)
+            running.store(false, Ordering::SeqCst);
+            let _ = tx.send(packet);
+        }
+    });
+
+    // Give target time to run
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    // Now simulate SetBreakpoints while running:
+    // 1. Check target is running
+    assert!(target_running.load(Ordering::SeqCst), "target should be running");
+
+    // 2. Send interrupt
+    gdb.send_interrupt().expect("interrupt failed");
+
+    // 3. Spin-wait for target_running to become false (with timeout)
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while target_running.load(Ordering::SeqCst) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timeout waiting for target to halt"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+
+    // Monitor should have received the stop-reply
+    let packet = rx.recv_timeout(std::time::Duration::from_secs(1))
+        .expect("monitor didn't receive stop-reply");
+    assert!(
+        packet.starts_with(b"T") || packet.starts_with(b"S"),
+        "expected stop-reply, got {:?}",
+        String::from_utf8_lossy(&packet[..packet.len().min(20)]),
+    );
+
+    // 4. Drain stale data (same pattern as SetBreakpoints handler)
+    let _ = gdb.take_pending_stop_reply();
+    gdb.drain_stale_data();
+
+    // 5. Set breakpoint while halted
+    gdb.set_breakpoint(addr).expect("set BP failed (while halted after interrupt)");
+
+    // 6. Resume
+    gdb.resume().expect("resume after BP set failed");
+
+    // 7. Wait for breakpoint hit
+    let reply = gdb.wait_stop().expect("wait_stop for BP hit failed");
+    assert_eq!(reply.signal, 5, "expected SIGTRAP, got {}", reply.signal);
+    let regs = gdb.read_registers().expect("read regs failed");
+    assert_eq!(regs.pc, addr, "PC should be at breakpoint: 0x{:08x}", addr);
+
+    gdb.remove_breakpoint(addr).expect("remove BP failed");
+    gdb.detach().expect("detach failed");
+}
+
+/// Verify that setting a breakpoint while the target is already stopped
+/// does NOT require halting — no interrupt is sent.
+/// Requires reconnection, so skip on Dolphin (single-use stub).
+#[test]
+#[ignore]
+fn set_breakpoint_while_stopped_no_halt() {
+    skip_on!(Target::Dolphin);
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let mut gdb = connect_noack();
+    let addr = bp_addr();
+    let target_running = Arc::new(AtomicBool::new(false));
+
+    // Target is stopped (just connected). needs_halt should be false.
+    assert!(!target_running.load(Ordering::SeqCst), "target should be stopped");
+
+    // Set breakpoint directly — no halt needed.
+    gdb.set_breakpoint(addr).expect("set BP failed");
+
+    // Verify the trap instruction is in place.
+    let mem = gdb.read_memory(addr, 4).expect("read BP addr failed");
+    assert_eq!(mem, &[0x7F, 0xE0, 0x00, 0x08], "expected trap instruction");
+
+    gdb.remove_breakpoint(addr).expect("remove BP failed");
+    gdb.detach().expect("detach failed");
+}
+
+/// Halt-for-breakpoints multiple times in a row to test the full cycle.
+/// resume → halt → set BP → resume → hit → remove → repeat with different state.
+/// Requires reconnection, so skip on Dolphin (single-use stub).
+#[test]
+#[ignore]
+fn set_breakpoint_while_running_cycle() {
+    skip_on!(Target::Dolphin);
+    let mut gdb = connect_noack();
+    let addr = bp_addr();
+
+    for i in 0..3 {
+        // Resume
+        gdb.resume().expect(&format!("resume {} failed", i));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // Halt
+        gdb.send_interrupt().expect(&format!("interrupt {} failed", i));
+        let reply = gdb.wait_stop().expect(&format!("wait_stop {} failed", i));
+        assert!(
+            reply.signal == 2 || reply.signal == 5,
+            "iter {}: unexpected signal {}",
+            i, reply.signal,
+        );
+
+        // Set breakpoint while halted
+        gdb.set_breakpoint(addr).expect(&format!("set BP {} failed", i));
+
+        // Resume — should hit BP
+        let reply = gdb.continue_and_wait().expect(&format!("continue {} failed", i));
+        assert_eq!(reply.signal, 5, "iter {}: expected SIGTRAP", i);
+        let regs = gdb.read_registers().expect(&format!("read regs {} failed", i));
+        assert_eq!(regs.pc, addr, "iter {}: PC mismatch", i);
+
+        // Remove and continue cycle
+        gdb.remove_breakpoint(addr).expect(&format!("remove BP {} failed", i));
+    }
+
+    gdb.detach().expect("detach failed");
+}
+
 // ── Single Step ─────────────────────────────────────────────────────────────
 
 /// Dolphin's `s` (single step) command is unreliable — it intermittently
