@@ -61,16 +61,22 @@ Integration tests require a running Wii/Dolphin with a GDB stub. Set the followi
 
 ```sh
 GDB_TEST_HOST=<ip>:<port> \
+GDB_TEST_TARGET=<dolphin|nintendont> \
 GDB_TEST_ELF=/path/to/game.elf \
 GDB_TEST_BP_SYMBOL=fapGm_Execute__Fv \
 cargo test --package gdb-client --test integration -- --ignored --test-threads=1
 ```
 
 - `GDB_TEST_HOST` — target IP and port (e.g. `192.168.1.100:2159`)
+- `GDB_TEST_TARGET` — `dolphin` or `nintendont`, used to skip tests that don't apply to a given stub
 - `GDB_TEST_ELF` — path to the game's ELF file (used for symbol lookup)
 - `GDB_TEST_BP_SYMBOL` — exact (mangled) name of a frequently-called function for breakpoint tests
 
 `--test-threads=1` is required since all tests share a single GDB connection.
+
+**Target-specific notes:**
+- Dolphin's GDB stub is single-use — it stops listening after the first connection detaches, so `reconnect_rapid` is skipped
+- Both stubs return a full register blob from `g` (Dolphin: 416 bytes, Nintendont: 412 bytes)
 
 ## Project structure
 

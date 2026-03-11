@@ -103,8 +103,11 @@ impl GDB {
                 let source = self.source.as_ref().ok_or(GDBError::NoSource)?;
                 match source {
                     GDBSource::Network((ip, port)) => {
-                        let addr = format!("{}:{}", ip, port);
-                        let stream = TcpStream::connect(&addr)?;
+                        let addr = std::net::SocketAddr::new(*ip, *port);
+                        let stream = TcpStream::connect_timeout(
+                            &addr,
+                            std::time::Duration::from_secs(5),
+                        )?;
                         stream.set_nonblocking(false)?;
                         self.stream = Some(stream);
                         self.state = GDBState::Connected;
@@ -130,6 +133,12 @@ impl GDB {
                 Ok(GDBResponse::Continued)
             }
             GDBCmd::Disconnect => {
+                self.target_running.store(false, Ordering::SeqCst);
+                // Shutdown the socket so any cloned streams (monitor threads)
+                // get an immediate error instead of blocking forever.
+                if let Some(ref stream) = self.stream {
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                }
                 self.stream = None;
                 self.state = GDBState::Disconnected;
                 self.no_ack_mode = false;
@@ -366,6 +375,23 @@ impl GDB {
             }
         }
         Ok(())
+    }
+
+    /// Attach an already-connected TCP stream (used when the connect was
+    /// performed in a background thread).
+    pub fn attach_stream(&mut self, stream: TcpStream) {
+        let _ = stream.set_nonblocking(false);
+        self.stream = Some(stream);
+        self.state = GDBState::Connected;
+        self.no_ack_mode = false;
+    }
+
+    /// Return the target address, if configured as a network source.
+    pub fn target_addr(&self) -> Option<std::net::SocketAddr> {
+        match self.source.as_ref()? {
+            GDBSource::Network((ip, port)) => Some(std::net::SocketAddr::new(*ip, *port)),
+            _ => None,
+        }
     }
 
     /// Full initialization: query_stop_reason + negotiate.
