@@ -109,6 +109,7 @@ impl GDB {
                             std::time::Duration::from_secs(5),
                         )?;
                         stream.set_nonblocking(false)?;
+                        stream.set_nodelay(true)?;
                         self.stream = Some(stream);
                         self.state = GDBState::Connected;
                         self.no_ack_mode = false;
