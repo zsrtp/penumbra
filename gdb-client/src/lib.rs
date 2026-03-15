@@ -109,7 +109,7 @@ impl GDB {
 /// - TCP: Direct socket connection with address tracking
 /// - Serial: Thread-safe wrapper around serial port with mutex for concurrent access
 #[derive(Debug)]
-pub(crate) enum Stream {
+pub enum Stream {
     Tcp(TcpStream, std::net::SocketAddr),
     Serial(Arc<Mutex<Box<dyn SerialPort>>>),
 }
@@ -152,7 +152,7 @@ impl Stream {
         }
     }
 
-    pub(crate) fn set_nonblocking(&mut self, nonblocking: bool) -> std::io::Result<()> {
+    pub fn set_nonblocking(&mut self, nonblocking: bool) -> std::io::Result<()> {
         match self {
             Stream::Tcp(tcp, _) => tcp.set_nonblocking(nonblocking),
             Stream::Serial(_) => Ok(()),
