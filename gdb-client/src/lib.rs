@@ -1,20 +1,284 @@
+//! GDB Remote Serial Protocol (RSP) client library.
+//!
+//! This library provides a Rust interface for connecting to GDB stubs
+//! over TCP or serial connections. It handles the RSP protocol including
+//! packet framing, checksums, and ACK handling.
+//!
+//! # Architecture
+//!
+//! - [`Stream`]: Low-level TCP/serial connection handling
+//! - [`GDB`]: High-level RSP protocol implementation
+//! - [`GDBSource`]: Connection configuration (address/serial params)
+//!
+//! # Example
+//!
+//! ```ignore
+//! use gdb_client::{GDB, GDBSource};
+//!
+//! // Connect to a GDB stub on TCP
+//! let source = GDBSource::Network(([192, 168, 1, 100].into(), 2159));
+//! let mut gdb = GDB::connect(&source)?;
+//!
+//! // Query stop reason
+//! let stop = gdb.query_stop_reason()?;
+//!
+//! // Read registers
+//! let regs = gdb.read_registers()?;
+//! ```
+
+use serialport::SerialPort;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
-#[derive(Debug)]
-pub enum GDBSource {
-    Network((std::net::IpAddr, u16)),
-    Serial(std::path::PathBuf),
+/// Result of an asynchronous connection attempt.
+///
+/// Returned by [`GDB::connect_async`] to allow callers to poll for
+/// connection completion without blocking.
+pub enum GDBConnectResult {
+    /// Connection completed successfully. Contains the connected GDB instance.
+    Connected(GDB),
+    /// Connection failed. Contains the error.
+    Error(GDBError),
+    /// Connection in progress. Contains a receiver to poll for completion.
+    InProgress(std::sync::mpsc::Receiver<Result<GDB, GDBError>>),
 }
 
-#[derive(Debug, Default)]
+impl GDB {
+    /// Connect to a GDB stub asynchronously (for GUI event loops).
+    ///
+    /// For TCP connections, spawns a background thread to handle the
+    /// blocking connect operation. Returns immediately with:
+    /// - [`GDBConnectResult::InProgress`] - poll the receiver for completion
+    /// - [`GDBConnectResult::Connected`] - serial connections complete immediately
+    /// - [`GDBConnectResult::Error`] - connection failed
+    ///
+    /// Use this in event-driven code where blocking is not acceptable.
+    pub fn connect_async(source: &GDBSource) -> GDBConnectResult {
+        match source {
+            GDBSource::Network((ip, port)) => {
+                let addr = std::net::SocketAddr::new(*ip, *port);
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let result = std::net::TcpStream::connect_timeout(
+                        &addr,
+                        std::time::Duration::from_secs(5),
+                    )
+                    .map_err(GDBError::Disconnected)
+                    .and_then(|stream| {
+                        let mut gdb = GDB::new();
+                        gdb.attach_stream(stream);
+                        Ok(gdb)
+                    });
+                    let _ = tx.send(result);
+                });
+                GDBConnectResult::InProgress(rx)
+            }
+            GDBSource::Serial { .. } => match Self::connect(source) {
+                Ok(gdb) => GDBConnectResult::Connected(gdb),
+                Err(e) => GDBConnectResult::Error(e),
+            },
+        }
+    }
+
+    /// Connect to a GDB stub synchronously.
+    ///
+    /// This is a blocking call that will wait for the connection to
+    /// complete. For TCP, this waits up to 5 seconds. For serial,
+    /// this returns immediately.
+    ///
+    /// Note: This only establishes the connection. Use
+    /// [`connect_and_init`][GDB::connect_and_init] to complete the
+    /// GDB handshake (query stop reason, negotiate features).
+    pub fn connect(source: &GDBSource) -> Result<Self, GDBError> {
+        let mut gdb = GDB::new();
+        gdb.stream = Some(Stream::connect(source)?);
+        gdb.state = GDBState::Connected;
+        gdb.no_ack_mode = false;
+        Ok(gdb)
+    }
+}
+
+/// Low-level stream connection handling (TCP or Serial).
+///
+/// This enum abstracts over the underlying transport layer, allowing
+/// the RSP protocol code to work identically with either connection type.
+///
+/// - TCP: Direct socket connection with address tracking
+/// - Serial: Thread-safe wrapper around serial port with mutex for concurrent access
+#[derive(Debug)]
+pub(crate) enum Stream {
+    Tcp(TcpStream, std::net::SocketAddr),
+    Serial(Arc<Mutex<Box<dyn SerialPort>>>),
+}
+
+impl Stream {
+    pub(crate) fn connect(source: &GDBSource) -> Result<Self, GDBError> {
+        match source {
+            GDBSource::Network((ip, port)) => {
+                let addr = std::net::SocketAddr::new(*ip, *port);
+                let stream = TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(5))?;
+                stream.set_nonblocking(false)?;
+                Ok(Stream::Tcp(stream, addr))
+            }
+            GDBSource::Serial { path, baud_rate } => {
+                let port: Box<dyn SerialPort> =
+                    serialport::new(path.to_string_lossy().into_owned(), *baud_rate)
+                        .open()
+                        .map_err(|e| {
+                            GDBError::InvalidResponse(format!("failed to open serial port: {}", e))
+                        })?;
+                Ok(Stream::Serial(Arc::new(Mutex::new(port))))
+            }
+        }
+    }
+
+    pub(crate) fn is_tcp(&self) -> bool {
+        matches!(self, Stream::Tcp(_, _))
+    }
+
+    pub(crate) fn tcp_addr(&self) -> Option<std::net::SocketAddr> {
+        match self {
+            Stream::Tcp(_, addr) => Some(*addr),
+            Stream::Serial(_) => None,
+        }
+    }
+
+    pub(crate) fn tcp_shutdown(&mut self) {
+        if let Stream::Tcp(tcp, _) = self {
+            let _ = tcp.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
+    pub(crate) fn set_nonblocking(&mut self, nonblocking: bool) -> std::io::Result<()> {
+        match self {
+            Stream::Tcp(tcp, _) => tcp.set_nonblocking(nonblocking),
+            Stream::Serial(_) => Ok(()),
+        }
+    }
+
+    pub(crate) fn try_clone(&self) -> Self {
+        match self {
+            Stream::Tcp(tcp, addr) => Stream::Tcp(tcp.try_clone().unwrap(), *addr),
+            Stream::Serial(port) => Stream::Serial(Arc::clone(port)),
+        }
+    }
+
+    pub(crate) fn drain_stale_data(&mut self) -> usize {
+        if let Stream::Tcp(stream, _) = self {
+            let orig_timeout = stream.read_timeout().ok().flatten();
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(1)));
+            let mut buf = [0u8; 256];
+            let mut total = 0;
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => total += n,
+                    Err(_) => break,
+                }
+            }
+            let _ = stream.set_read_timeout(orig_timeout);
+            return total;
+        }
+        0
+    }
+
+    pub(crate) fn read_packet(&mut self, no_ack: bool) -> Option<Vec<u8>> {
+        read_packet_from_stream(self, no_ack)
+    }
+}
+
+impl Clone for Stream {
+    fn clone(&self) -> Self {
+        match self {
+            Stream::Tcp(tcp, addr) => Stream::Tcp(tcp.try_clone().unwrap(), *addr),
+            Stream::Serial(port) => Stream::Serial(Arc::clone(port)),
+        }
+    }
+}
+
+impl Read for Stream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Stream::Tcp(s, _) => s.read(buf),
+            Stream::Serial(s) => s.lock().unwrap().read(buf),
+        }
+    }
+}
+
+impl Write for Stream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Stream::Tcp(s, _) => s.write(buf),
+            Stream::Serial(s) => s.lock().unwrap().write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Stream::Tcp(s, _) => s.flush(),
+            Stream::Serial(s) => s.lock().unwrap().flush(),
+        }
+    }
+}
+
+/// Connection destination configuration.
+///
+/// Specifies how to connect to a GDB stub - either over TCP/IP
+/// or via a serial port.
+#[derive(Debug, Clone)]
+pub enum GDBSource {
+    /// TCP/IP connection: (IP address, port)
+    ///
+    /// Standard GDB port is 2159.
+    Network((std::net::IpAddr, u16)),
+    /// Serial connection: (device path, baud rate)
+    ///
+    /// Common baud rates: 115200, 57600, 9600
+    Serial {
+        path: std::path::PathBuf,
+        baud_rate: u32,
+    },
+}
+
+impl Default for GDBSource {
+    fn default() -> Self {
+        GDBSource::Network(([127, 0, 0, 1].into(), 2159))
+    }
+}
+
+/// GDB Remote Serial Protocol (RSP) client.
+///
+/// This is the main struct for interacting with a GDB stub. It provides
+/// methods for all common GDB operations:
+///
+/// - **Connection**: [`connect`][GDB::connect], [`connect_async`][GDB::connect_async]
+/// - **Execution control**: [`halt`][GDB::halt], [`resume`][GDB::resume], [`step`][GDB::step]
+/// - **Register access**: [`read_registers`][GDB::read_registers], [`read_register`][GDB::read_register]
+/// - **Memory access**: [`read_memory`][GDB::read_memory], [`write_memory`][GDB::write_memory]
+/// - **Breakpoints**: [`set_breakpoint`][GDB::set_breakpoint], [`remove_breakpoint`][GDB::remove_breakpoint]
+///
+/// # Thread Safety
+///
+/// The GDB struct is not thread-safe by itself. To read packets while
+/// the target is running (for async stop detection), use
+/// [`try_clone_stream`][GDB::try_clone_stream] to create a separate
+/// instance that shares the underlying connection.
+///
+/// # Protocol State
+///
+/// - `no_ack_mode`: When true, the stub supports qSupported and we skip ACK handling
+/// - `pending_stop_reply`: Catches stop replies that arrive before our `c` command ACK
+/// - `target_running`: Atomic flag to prevent concurrent reads from stream
+#[derive(Debug, Default, Clone)]
 pub struct GDB {
-    pub source: Option<GDBSource>,
+    /// Current connection state.
     pub state: GDBState,
-    stream: Option<TcpStream>,
+    /// Underlying stream connection (None when disconnected).
+    stream: Option<Stream>,
+    /// Whether no-ack mode has been negotiated with the stub.
     no_ack_mode: bool,
     /// Stop-reply consumed by send_packet's ACK loop (happens when target
     /// hits a breakpoint before the stub ACKs our `c` command).
@@ -24,71 +288,109 @@ pub struct GDB {
     target_running: Arc<AtomicBool>,
 }
 
+/// Errors that can occur during GDB RSP operations.
 #[derive(Debug, Error)]
 pub enum GDBError {
+    /// Connection was lost (IO error).
     #[error("GDB server disconnected")]
     Disconnected(#[from] std::io::Error),
+    /// Response from stub was malformed or unexpected.
     #[error("Invalid response: {0}")]
     InvalidResponse(String),
+    /// Operation requires an active connection.
     #[error("Not connected")]
     NotConnected,
+    /// No connection destination specified.
     #[error("No source configured")]
     NoSource,
+    /// Stub sent NACK instead of ACK (protocol error).
     #[error("Negative ACK from server")]
     NegativeAck,
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+/// Current connection state.
+#[derive(Debug, Default, PartialEq, Eq, Clone)]
 pub enum GDBState {
+    /// No active connection.
     #[default]
     Disconnected,
     Connected,
 }
 
+/// Commands that can be sent to the GDB client (used for threaded GUI).
 #[derive(Debug)]
 pub enum GDBCmd {
-    Connect,
+    /// Connect to a GDB stub.
+    Connect(GDBSource),
     /// Connect + query_stop_reason + negotiate (full initialization).
-    ConnectAndInit,
+    ConnectAndInit(GDBSource),
+    /// Send interrupt (Ctrl+C) to halt the target.
     Halt,
+    /// Resume target execution.
     Continue,
+    /// Disconnect from the stub.
     Disconnect,
-    SetSource(GDBSource),
 }
 
+/// Responses from the GDB client (used for threaded GUI).
 #[derive(Debug)]
 pub enum GDBResponse {
+    /// Connection successful.
     Connected,
+    /// Disconnected from stub.
     Disconnected,
+    /// Target has halted (due to breakpoint, interrupt, etc.).
     Halted,
+    /// Target has resumed execution.
     Continued,
+    /// An error occurred.
     Error(String),
 }
 
+/// Stop reply from GDB stub (T or S packet).
+///
+/// Sent when the target stops execution - due to breakpoint,
+/// interrupt, exception, or reaching a watchpoint.
 #[derive(Debug, Clone)]
 pub struct StopReply {
+    /// The signal number that caused the stop (e.g., 5 = SIGTRAP, 2 = SIGINT).
     pub signal: u8,
 }
 
+/// PowerPC register state.
+///
+/// Contains the full register set as returned by the GDB `g` packet.
+/// For PowerPC, this includes:
+/// - GPRs: General purpose registers (r0-r31)
+/// - FPRs: Floating point registers (fp0-fp31)
+/// - Special: PC, MSR, CR, LR, CTR, XER, FPSCR
 #[derive(Debug, Clone, Default)]
 pub struct PpcRegisters {
+    /// General purpose registers (r0 through r31).
     pub gpr: [u32; 32],
+    /// Floating point registers (fp0 through fp31).
     pub fpr: [u64; 32],
+    /// Program Counter (Instruction Address).
     pub pc: u32,
+    /// Machine State Register.
     pub msr: u32,
+    /// Condition Register.
     pub cr: u32,
+    /// Link Register.
     pub lr: u32,
+    /// Count Register (used for loop optimization).
     pub ctr: u32,
+    /// Integer Exception Register.
     pub xer: u32,
+    /// Floating Point Status and Control Register.
     pub fpscr: u64,
     /// Size of the `g` response blob in bytes (for diagnostics).
     pub reg_blob_size: usize,
 }
 
 impl GDB {
-    pub fn new(source: GDBSource) -> Self {
+    pub fn new() -> Self {
         Self {
-            source: Some(source),
             state: GDBState::default(),
             stream: None,
             no_ack_mode: false,
@@ -97,30 +399,20 @@ impl GDB {
         }
     }
 
+    /// Execute a command from the GDBCmd enum.
+    ///
+    /// This is the main entry point for threaded GUI applications.
+    /// Each command corresponds to a GDB operation.
     pub fn execute_cmd(&mut self, cmd: GDBCmd) -> Result<GDBResponse, GDBError> {
         match cmd {
-            GDBCmd::Connect => {
-                let source = self.source.as_ref().ok_or(GDBError::NoSource)?;
-                match source {
-                    GDBSource::Network((ip, port)) => {
-                        let addr = std::net::SocketAddr::new(*ip, *port);
-                        let stream = TcpStream::connect_timeout(
-                            &addr,
-                            std::time::Duration::from_secs(5),
-                        )?;
-                        stream.set_nonblocking(false)?;
-                        self.stream = Some(stream);
-                        self.state = GDBState::Connected;
-                        self.no_ack_mode = false;
-                        Ok(GDBResponse::Connected)
-                    }
-                    GDBSource::Serial(_) => {
-                        Err(GDBError::InvalidResponse("Serial not yet supported".into()))
-                    }
-                }
+            GDBCmd::Connect(source) => {
+                self.stream = Some(Stream::connect(&source)?);
+                self.state = GDBState::Connected;
+                self.no_ack_mode = false;
+                Ok(GDBResponse::Connected)
             }
-            GDBCmd::ConnectAndInit => {
-                self.execute_cmd(GDBCmd::Connect)?;
+            GDBCmd::ConnectAndInit(source) => {
+                self.execute_cmd(GDBCmd::Connect(source))?;
                 self.connect_and_init()?;
                 Ok(GDBResponse::Connected)
             }
@@ -134,26 +426,26 @@ impl GDB {
             }
             GDBCmd::Disconnect => {
                 self.target_running.store(false, Ordering::SeqCst);
-                // Shutdown the socket so any cloned streams (monitor threads)
-                // get an immediate error instead of blocking forever.
-                if let Some(ref stream) = self.stream {
-                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                if let Some(mut stream) = self.stream.take() {
+                    stream.tcp_shutdown();
                 }
-                self.stream = None;
                 self.state = GDBState::Disconnected;
                 self.no_ack_mode = false;
-                Ok(GDBResponse::Disconnected)
-            }
-            GDBCmd::SetSource(gdbsource) => {
-                self.source = Some(gdbsource);
                 Ok(GDBResponse::Disconnected)
             }
         }
     }
 
+    pub fn get_stream(&mut self) -> Result<&mut Stream, GDBError> {
+        if let Some(ref mut stream) = self.stream {
+            return Ok(stream);
+        }
+        Err(GDBError::NotConnected)
+    }
+
     /// Send Ctrl-C (0x03) interrupt byte without reading a response.
     pub fn send_interrupt(&mut self) -> Result<(), GDBError> {
-        let stream = self.stream.as_mut().ok_or(GDBError::NotConnected)?;
+        let stream = self.get_stream()?;
         stream.write_all(&[0x03])?;
         stream.flush()?;
         Ok(())
@@ -166,11 +458,11 @@ impl GDB {
         // duplicate); if the first packet isn't a valid stop-reply, try
         // reading one more. Any leftover data is consumed by the next
         // send_packet() call.
-        let first = self.read_packet()?;
+        let first = self.read_packet_from_stream()?;
         match parse_stop_reply(&first) {
             Ok(sr) => Ok(sr),
             Err(_) => {
-                let second = self.read_packet()?;
+                let second = self.read_packet_from_stream()?;
                 parse_stop_reply(&second)
             }
         }
@@ -189,7 +481,7 @@ impl GDB {
         if let Some(reply) = self.pending_stop_reply.take() {
             return parse_stop_reply(&reply);
         }
-        let reply = self.read_packet()?;
+        let reply = self.read_packet_from_stream()?;
         parse_stop_reply(&reply)
     }
 
@@ -220,7 +512,7 @@ impl GDB {
         }
         for i in 0..32 {
             let o = i * 4;
-            regs.gpr[i] = u32::from_be_bytes([bytes[o], bytes[o+1], bytes[o+2], bytes[o+3]]);
+            regs.gpr[i] = u32::from_be_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
         }
 
         if bytes.len() >= 416 {
@@ -228,23 +520,41 @@ impl GDB {
             let mut offset = 128;
             for i in 0..32 {
                 regs.fpr[i] = u64::from_be_bytes([
-                    bytes[offset], bytes[offset+1], bytes[offset+2], bytes[offset+3],
-                    bytes[offset+4], bytes[offset+5], bytes[offset+6], bytes[offset+7],
+                    bytes[offset],
+                    bytes[offset + 1],
+                    bytes[offset + 2],
+                    bytes[offset + 3],
+                    bytes[offset + 4],
+                    bytes[offset + 5],
+                    bytes[offset + 6],
+                    bytes[offset + 7],
                 ]);
                 offset += 8;
             }
             let read_u32 = |o: usize| -> u32 {
-                u32::from_be_bytes([bytes[o], bytes[o+1], bytes[o+2], bytes[o+3]])
+                u32::from_be_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]])
             };
-            regs.pc = read_u32(offset); offset += 4;
-            regs.msr = read_u32(offset); offset += 4;
-            regs.cr = read_u32(offset); offset += 4;
-            regs.lr = read_u32(offset); offset += 4;
-            regs.ctr = read_u32(offset); offset += 4;
-            regs.xer = read_u32(offset); offset += 4;
+            regs.pc = read_u32(offset);
+            offset += 4;
+            regs.msr = read_u32(offset);
+            offset += 4;
+            regs.cr = read_u32(offset);
+            offset += 4;
+            regs.lr = read_u32(offset);
+            offset += 4;
+            regs.ctr = read_u32(offset);
+            offset += 4;
+            regs.xer = read_u32(offset);
+            offset += 4;
             regs.fpscr = u64::from_be_bytes([
-                bytes[offset], bytes[offset+1], bytes[offset+2], bytes[offset+3],
-                bytes[offset+4], bytes[offset+5], bytes[offset+6], bytes[offset+7],
+                bytes[offset],
+                bytes[offset + 1],
+                bytes[offset + 2],
+                bytes[offset + 3],
+                bytes[offset + 4],
+                bytes[offset + 5],
+                bytes[offset + 6],
+                bytes[offset + 7],
             ]);
         } else {
             // Stub only returned GPRs — read special registers individually.
@@ -296,7 +606,10 @@ impl GDB {
         let hex = std::str::from_utf8(&reply)
             .map_err(|_| GDBError::InvalidResponse("non-utf8 memory data".into()))?;
         if hex.starts_with('E') {
-            return Err(GDBError::InvalidResponse(format!("memory read error: {}", hex)));
+            return Err(GDBError::InvalidResponse(format!(
+                "memory read error: {}",
+                hex
+            )));
         }
         decode_hex(hex)
     }
@@ -379,19 +692,24 @@ impl GDB {
 
     /// Attach an already-connected TCP stream (used when the connect was
     /// performed in a background thread).
-    pub fn attach_stream(&mut self, stream: TcpStream) {
+    fn attach_stream(&mut self, stream: std::net::TcpStream) {
         let _ = stream.set_nonblocking(false);
-        self.stream = Some(stream);
+        let addr = stream
+            .peer_addr()
+            .unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
+        self.stream = Some(Stream::Tcp(stream, addr));
         self.state = GDBState::Connected;
         self.no_ack_mode = false;
     }
 
-    /// Return the target address, if configured as a network source.
+    /// Return the target address if connected via TCP.
     pub fn target_addr(&self) -> Option<std::net::SocketAddr> {
-        match self.source.as_ref()? {
-            GDBSource::Network((ip, port)) => Some(std::net::SocketAddr::new(*ip, *port)),
-            _ => None,
-        }
+        self.stream.as_ref().and_then(|s| s.tcp_addr())
+    }
+
+    /// Check if the current connection is serial.
+    pub fn is_serial(&self) -> bool {
+        self.stream.as_ref().map_or(false, |s| !s.is_tcp())
     }
 
     /// Full initialization: query_stop_reason + negotiate.
@@ -406,14 +724,36 @@ impl GDB {
     /// Block reading until a stop-reply packet arrives. Used when the target
     /// is running after `c` to detect breakpoint hits, exceptions, etc.
     pub fn wait_stop(&mut self) -> Result<StopReply, GDBError> {
-        let reply = self.read_packet()?;
+        let reply = self.read_packet_from_stream()?;
         parse_stop_reply(&reply)
     }
 
-    /// Try to clone the underlying TCP stream (for the RSP monitor thread).
-    pub fn try_clone_stream(&self) -> Result<TcpStream, GDBError> {
+    /// Try to clone the underlying stream for the RSP monitor thread.
+    /// Returns a new GDB with a cloned stream.
+    pub fn try_clone_stream(&self) -> Result<GDB, GDBError> {
         let stream = self.stream.as_ref().ok_or(GDBError::NotConnected)?;
-        stream.try_clone().map_err(GDBError::Disconnected)
+        Ok(GDB {
+            state: self.state.clone(),
+            stream: Some(stream.try_clone()),
+            no_ack_mode: self.no_ack_mode,
+            pending_stop_reply: None,
+            target_running: self.target_running.clone(),
+        })
+    }
+
+    /// Read a packet from this GDB's stream (for monitor thread).
+    /// Returns the packet payload if successful.
+    pub fn read_packet(&mut self) -> Option<Vec<u8>> {
+        let stream = self.stream.as_mut()?;
+        stream.read_packet(self.no_ack_mode)
+    }
+
+    /// Read a packet from this GDB's stream.
+    fn read_packet_from_stream(&mut self) -> Result<Vec<u8>, GDBError> {
+        let no_ack = self.no_ack_mode;
+        let stream = self.get_stream()?;
+        read_packet_from_stream(&mut *stream, no_ack)
+            .ok_or_else(|| GDBError::InvalidResponse("failed to read RSP packet".into()))
     }
 
     /// Whether no-ack mode was successfully negotiated.
@@ -436,26 +776,12 @@ impl GDB {
         self.target_running.store(running, Ordering::SeqCst);
     }
 
-    /// Drain any stale data from the TCP socket using a non-blocking read.
-    /// Returns the number of bytes drained.
+    /// Drain any stale data from the TCP socket.
     pub fn drain_stale_data(&mut self) -> usize {
-        let stream = match self.stream.as_mut() {
-            Some(s) => s,
-            None => return 0,
-        };
-        let orig_timeout = stream.read_timeout().ok().flatten();
-        let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(1)));
-        let mut buf = [0u8; 256];
-        let mut total = 0;
-        loop {
-            match stream.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => total += n,
-                Err(_) => break,
-            }
+        if let Some(ref mut stream) = self.stream {
+            return stream.drain_stale_data();
         }
-        let _ = stream.set_read_timeout(orig_timeout);
-        total
+        0
     }
 
     /// Send a packet and read the response in one call.
@@ -467,72 +793,85 @@ impl GDB {
             ));
         }
         self.send_packet(data)?;
-        self.read_packet()
-    }
-
-    /// Read a single RSP packet (`$...#xx`) from the stream, send `+` ACK, return the payload.
-    fn read_packet(&mut self) -> Result<Vec<u8>, GDBError> {
-        let stream = self.stream.as_mut().ok_or(GDBError::NotConnected)?;
-        read_packet_from_stream(stream, self.no_ack_mode)
-            .ok_or_else(|| GDBError::InvalidResponse("failed to read RSP packet".into()))
+        self.read_packet_from_stream()
     }
 
     fn send_packet(&mut self, data: &[u8]) -> Result<(), GDBError> {
-        let stream = self.stream.as_mut().ok_or(GDBError::NotConnected)?;
+        let no_ack = self.no_ack_mode;
+        let pending_payload;
+        {
+            let stream = self.get_stream()?;
 
-        let checksum: u8 = data.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
-        let mut packet = Vec::with_capacity(data.len() + 4);
-        packet.push(b'$');
-        packet.extend_from_slice(data);
-        packet.push(b'#');
-        packet.push(hex_digit(checksum >> 4));
-        packet.push(hex_digit(checksum & 0x0f));
+            let checksum: u8 = data.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
+            let mut packet = Vec::with_capacity(data.len() + 4);
+            packet.push(b'$');
+            packet.extend_from_slice(data);
+            packet.push(b'#');
+            packet.push(hex_digit(checksum >> 4));
+            packet.push(hex_digit(checksum & 0x0f));
 
-        stream.write_all(&packet)?;
-        stream.flush()?;
+            stream.write_all(&packet)?;
+            stream.flush()?;
 
-        // In no-ack mode, don't wait for ACK
-        if self.no_ack_mode {
-            return Ok(());
-        }
-
-        // Read ACK, consuming any unsolicited server packets (stop-replies)
-        // that may be buffered ahead of it.
-        let mut ack = [0u8; 1];
-        loop {
-            stream.read_exact(&mut ack)?;
-            match ack[0] {
-                b'+' => return Ok(()),
-                b'-' => return Err(GDBError::NegativeAck),
-                b'$' => {
-                    // Unsolicited packet — consume it ($...#xx) and ACK
-                    let mut payload = Vec::new();
-                    loop {
-                        stream.read_exact(&mut ack)?;
-                        if ack[0] == b'#' {
-                            break;
-                        }
-                        payload.push(ack[0]);
-                    }
-                    let mut _chk = [0u8; 2];
-                    stream.read_exact(&mut _chk)?;
-                    stream.write_all(b"+")?;
-                    stream.flush()?;
-                    // Save stop-replies so the monitor thread can find them
-                    if payload.first() == Some(&b'T') || payload.first() == Some(&b'S') {
-                        self.pending_stop_reply = Some(payload);
-                    }
-                }
-                _ => {} // skip other junk bytes
+            // In no-ack mode, don't wait for ACK
+            if no_ack {
+                return Ok(());
             }
+
+            // Read ACK, consuming any unsolicited server packets (stop-replies)
+            // that may be buffered ahead of it.
+            let mut ack = [0u8; 1];
+            pending_payload = loop {
+                stream.read_exact(&mut ack)?;
+                match ack[0] {
+                    b'+' => break None,
+                    b'-' => return Err(GDBError::NegativeAck),
+                    b'$' => {
+                        // Unsolicited packet — consume it ($...#xx) and ACK
+                        let mut payload = Vec::new();
+                        loop {
+                            stream.read_exact(&mut ack)?;
+                            if ack[0] == b'#' {
+                                break;
+                            }
+                            payload.push(ack[0]);
+                        }
+                        let mut _chk = [0u8; 2];
+                        stream.read_exact(&mut _chk)?;
+                        stream.write_all(b"+")?;
+                        stream.flush()?;
+                        // Save stop-replies so the monitor thread can find them
+                        if payload.first() == Some(&b'T') || payload.first() == Some(&b'S') {
+                            break Some(payload);
+                        }
+                    }
+                    _ => {} // skip other junk bytes
+                }
+            };
         }
+        if let Some(payload) = pending_payload {
+            self.pending_stop_reply = Some(payload);
+        }
+        Ok(())
     }
 }
 
-/// Read a single RSP packet ($payload#xx) from a raw TcpStream.
-/// Returns the payload bytes, or None on error/EOF.
-pub fn read_packet_from_stream(stream: &TcpStream, no_ack: bool) -> Option<Vec<u8>> {
-    let mut reader = stream;
+/// Read a single RSP packet from a stream.
+///
+/// The GDB Remote Serial Protocol uses a simple framing scheme:
+/// 1. Find the start marker: `$`
+/// 2. Read until end marker: `#`
+/// 3. Read 2-digit hexadecimal checksum
+/// 4. Send `+` ACK (unless `no_ack` is true)
+///
+/// This function handles steps 1-4 and returns the payload (without
+/// the `$` and `#` markers and checksum).
+///
+/// Returns `None` on connection error or EOF.
+pub fn read_packet_from_stream<R: Read + Write + ?Sized>(
+    reader: &mut R,
+    no_ack: bool,
+) -> Option<Vec<u8>> {
     let mut byte = [0u8; 1];
 
     // Skip until '$', counting skipped bytes for diagnostics
@@ -573,14 +912,16 @@ pub fn read_packet_from_stream(stream: &TcpStream, no_ack: bool) -> Option<Vec<u
     if received_csum != computed_csum {
         eprintln!(
             "RSP checksum mismatch: received {:02x}, computed {:02x}, payload len={}",
-            received_csum, computed_csum, payload.len()
+            received_csum,
+            computed_csum,
+            payload.len()
         );
     }
 
     // Send ACK only if not in no-ack mode
     if !no_ack {
-        let _ = (&*stream).write_all(b"+");
-        let _ = (&*stream).flush();
+        let _ = reader.write_all(b"+");
+        let _ = reader.flush();
     }
 
     Some(payload)
@@ -657,7 +998,10 @@ mod tests {
 
     #[test]
     fn decode_hex_basic() {
-        assert_eq!(decode_hex("deadbeef").unwrap(), vec![0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(
+            decode_hex("deadbeef").unwrap(),
+            vec![0xde, 0xad, 0xbe, 0xef]
+        );
         assert_eq!(decode_hex("00ff").unwrap(), vec![0x00, 0xff]);
         assert_eq!(decode_hex("").unwrap(), vec![]);
     }
@@ -688,5 +1032,4 @@ mod tests {
         assert!(parse_stop_reply(b"OK").is_err());
         assert!(parse_stop_reply(b"E14").is_err());
     }
-
 }

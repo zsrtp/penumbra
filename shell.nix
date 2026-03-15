@@ -4,6 +4,7 @@ let
     wayland
     libxkbcommon
     libGL
+    udev
   ];
 in {
   devShell = with pkgs; mkShell {
@@ -12,6 +13,8 @@ in {
       cargo
       rustc
       rust-analyzer
+      udev
+      pkg-config
     ];
     RUST_LOG = "debug";
     RUST_SRC_PATH = "${pkgs.rust.packages.stable.rustPlatform.rustLibSrc}";

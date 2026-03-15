@@ -1,3 +1,16 @@
+//! Debug Adapter Protocol (DAP) server implementation.
+//!
+//! This module implements the Debug Adapter Protocol, allowing penumbra
+//! to act as a debug server for IDEs like VS Code.
+//!
+//! The adapter translates DAP requests into GDB RSP commands and
+//! translates responses back into DAP format.
+//!
+//! Key concepts:
+//! - [`DebugAdapter`][adapter::DebugAdapter]: Main state machine for DAP handling
+//! - `start_rsp_monitor()`: Background thread for async stop detection
+//! - `needs_halt_for_breakpoints()`: Determines if breakpoint changes require halting
+
 pub mod adapter;
 pub mod symbols;
 
@@ -61,9 +74,14 @@ fn run_attach_diagnostics<R: Read, W: Write>(
     }
     // SHM MAGIC at 0xD3003600 (uncached MEM2 on PPC)
     if let Some(magic) = read_u32_be(gdb, 0xD300_3600) {
-        let ok = if magic == 0x4744_4253 { "OK" } else { "MISMATCH" };
+        let ok = if magic == 0x4744_4253 {
+            "OK"
+        } else {
+            "MISMATCH"
+        };
         server.send_event(output_event(&format!(
-            "Diag: SHM MAGIC = 0x{:08X} (expect 0x47444253) [{}]", magic, ok
+            "Diag: SHM MAGIC = 0x{:08X} (expect 0x47444253) [{}]",
+            magic, ok
         )))?;
     } else {
         server.send_event(output_event("Diag: SHM MAGIC read failed"))?;
@@ -80,7 +98,8 @@ fn run_attach_diagnostics<R: Read, W: Write>(
             _ => "UNKNOWN",
         };
         server.send_event(output_event(&format!(
-            "Diag: SHM STATE = {} ({})", state, name
+            "Diag: SHM STATE = {} ({})",
+            state, name
         )))?;
     }
 
@@ -89,7 +108,11 @@ fn run_attach_diagnostics<R: Read, W: Write>(
     let prog_handler = read_u32_be(gdb, 0x8000_3018); // 0x80003000 + 6*4
     let trace_handler = read_u32_be(gdb, 0x8000_3028); // 0x80003000 + 10*4
     if let (Some(ph), Some(th)) = (prog_handler, trace_handler) {
-        let same = if ph == th { " (same = gdb stub)" } else { " (DIFFERENT!)" };
+        let same = if ph == th {
+            " (same = gdb stub)"
+        } else {
+            " (DIFFERENT!)"
+        };
         server.send_event(output_event(&format!(
             "Diag: Exc handlers: Program=0x{:08X} Trace=0x{:08X}{}",
             ph, th, same
@@ -110,7 +133,6 @@ pub fn run_dap_server(
     let server_output = server.output.clone();
 
     let mut adapter = DebugAdapter::new();
-    let no_ack = Arc::new(AtomicBool::new(false));
     let suppress_stop_event = Arc::new(AtomicBool::new(false));
 
     'main: loop {
@@ -145,14 +167,17 @@ pub fn run_dap_server(
                 }
 
                 let target_str = merged.get("target").and_then(|v| v.as_str()).unwrap_or("?");
-                let program_str = merged.get("program").and_then(|v| v.as_str()).unwrap_or("?");
+                let program_str = merged
+                    .get("program")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
                 server.send_event(output_event(&format!(
-                    "Attaching to {} (program: {})", target_str, program_str
+                    "Attaching to {} (program: {})",
+                    target_str, program_str
                 )))?;
 
                 match adapter.handle_attach(&merged) {
                     Ok(()) => {
-                        no_ack.store(adapter.gdb.is_no_ack_mode(), Ordering::SeqCst);
                         let di_path = merged.get("debugInfo").and_then(|v| v.as_str());
                         server.send_event(output_event(&format!(
                             "Connected (no-ack: {}, debugInfo: {:?}, project_root: {:?})",
@@ -179,7 +204,8 @@ pub fn run_dap_server(
                 let drained = adapter.gdb.drain_stale_data();
                 if adapter.verbose && drained > 0 {
                     server.send_event(output_event(&format!(
-                        "Drained {} stale bytes before resume", drained
+                        "Drained {} stale bytes before resume",
+                        drained
                     )))?;
                 }
                 match adapter.handle_configuration_done() {
@@ -191,28 +217,30 @@ pub fn run_dap_server(
                             &adapter.gdb,
                             &server_output,
                             &adapter.gdb.target_running_flag(),
-                            &no_ack,
                             &suppress_stop_event,
                             adapter.verbose,
                         );
                     }
                     Err(e) => {
-                        server.send_event(output_event(&format!(
-                            "ConfigurationDone error: {}", e
-                        )))?;
+                        server
+                            .send_event(output_event(&format!("ConfigurationDone error: {}", e)))?;
                         server.respond(req.error(&e.to_string()))?;
                     }
                 }
             }
 
             Command::SetBreakpoints(args) => {
-                let file = args.source.path.as_deref()
+                let file = args
+                    .source
+                    .path
+                    .as_deref()
                     .or(args.source.name.as_deref())
                     .unwrap_or("?");
                 let count = args.breakpoints.as_ref().map(|b| b.len()).unwrap_or(0);
                 server.send_event(output_event(&format!(
                     "SetBreakpoints: {} breakpoints in {:?} (path={:?}, name={:?})",
-                    count, file,
+                    count,
+                    file,
                     args.source.path.as_deref(),
                     args.source.name.as_deref(),
                 )))?;
@@ -222,14 +250,15 @@ pub fn run_dap_server(
                 if was_running {
                     if adapter.verbose {
                         server.send_event(output_event(
-                            "SetBreakpoints: target running, halting transparently"
+                            "SetBreakpoints: target running, halting transparently",
                         ))?;
                     }
                     suppress_stop_event.store(true, Ordering::SeqCst);
                     if let Err(e) = adapter.gdb.send_interrupt() {
                         suppress_stop_event.store(false, Ordering::SeqCst);
                         server.send_event(output_event(&format!(
-                            "SetBreakpoints: interrupt failed: {}", e
+                            "SetBreakpoints: interrupt failed: {}",
+                            e
                         )))?;
                         server.respond(req.error(&format!("failed to halt target: {}", e)))?;
                         continue;
@@ -240,7 +269,7 @@ pub fn run_dap_server(
                         if Instant::now() > deadline {
                             suppress_stop_event.store(false, Ordering::SeqCst);
                             server.send_event(output_event(
-                                "SetBreakpoints: timeout waiting for target to halt"
+                                "SetBreakpoints: timeout waiting for target to halt",
                             ))?;
                             server.respond(req.error("timeout waiting for target to halt"))?;
                             continue 'main;
@@ -252,15 +281,14 @@ pub fn run_dap_server(
                     let drained = adapter.gdb.drain_stale_data();
                     if adapter.verbose && drained > 0 {
                         server.send_event(output_event(&format!(
-                            "SetBreakpoints: drained {} stale bytes after halt", drained
+                            "SetBreakpoints: drained {} stale bytes after halt",
+                            drained
                         )))?;
                     }
                 }
 
-                let breakpoints = adapter.handle_set_breakpoints(
-                    &args.source,
-                    &args.breakpoints.unwrap_or_default(),
-                );
+                let breakpoints = adapter
+                    .handle_set_breakpoints(&args.source, &args.breakpoints.unwrap_or_default());
                 for bp in &breakpoints {
                     if !bp.verified {
                         server.send_event(output_event(&format!(
@@ -274,10 +302,12 @@ pub fn run_dap_server(
                     for addr in adapter.breakpoint_addrs() {
                         match adapter.gdb.read_memory(addr, 4) {
                             Ok(bytes) if bytes.len() == 4 => {
-                                let insn = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                                let insn =
+                                    u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
                                 if insn == 0x7FE00008 {
                                     server.send_event(output_event(&format!(
-                                        "  BP 0x{:08X}: trap verified", addr
+                                        "  BP 0x{:08X}: trap verified",
+                                        addr
                                     )))?;
                                 } else {
                                     server.send_event(output_event(&format!(
@@ -287,12 +317,14 @@ pub fn run_dap_server(
                             }
                             Ok(_) => {
                                 server.send_event(output_event(&format!(
-                                    "  BP 0x{:08X}: short read", addr
+                                    "  BP 0x{:08X}: short read",
+                                    addr
                                 )))?;
                             }
                             Err(e) => {
                                 server.send_event(output_event(&format!(
-                                    "  BP 0x{:08X}: read failed: {}", addr, e
+                                    "  BP 0x{:08X}: read failed: {}",
+                                    addr, e
                                 )))?;
                             }
                         }
@@ -308,14 +340,15 @@ pub fn run_dap_server(
                     let drained = adapter.gdb.drain_stale_data();
                     if adapter.verbose && drained > 0 {
                         server.send_event(output_event(&format!(
-                            "SetBreakpoints: drained {} stale bytes before resume", drained
+                            "SetBreakpoints: drained {} stale bytes before resume",
+                            drained
                         )))?;
                     }
                     match adapter.handle_continue() {
                         Ok(()) => {
                             if adapter.verbose {
                                 server.send_event(output_event(
-                                    "SetBreakpoints: target resumed after breakpoint update"
+                                    "SetBreakpoints: target resumed after breakpoint update",
                                 ))?;
                             }
                             suppress_stop_event.store(false, Ordering::SeqCst);
@@ -324,7 +357,6 @@ pub fn run_dap_server(
                                 &adapter.gdb,
                                 &server_output,
                                 &adapter.gdb.target_running_flag(),
-                                &no_ack,
                                 &suppress_stop_event,
                                 adapter.verbose,
                             );
@@ -332,7 +364,8 @@ pub fn run_dap_server(
                         Err(e) => {
                             suppress_stop_event.store(false, Ordering::SeqCst);
                             server.send_event(output_event(&format!(
-                                "SetBreakpoints: resume failed: {}", e
+                                "SetBreakpoints: resume failed: {}",
+                                e
                             )))?;
                             // Target is now stopped — emit a Stopped event so the
                             // UI reflects the actual state.
@@ -348,14 +381,15 @@ pub fn run_dap_server(
                 if was_running {
                     if adapter.verbose {
                         server.send_event(output_event(
-                            "SetFunctionBreakpoints: target running, halting transparently"
+                            "SetFunctionBreakpoints: target running, halting transparently",
                         ))?;
                     }
                     suppress_stop_event.store(true, Ordering::SeqCst);
                     if let Err(e) = adapter.gdb.send_interrupt() {
                         suppress_stop_event.store(false, Ordering::SeqCst);
                         server.send_event(output_event(&format!(
-                            "SetFunctionBreakpoints: interrupt failed: {}", e
+                            "SetFunctionBreakpoints: interrupt failed: {}",
+                            e
                         )))?;
                         server.respond(req.error(&format!("failed to halt target: {}", e)))?;
                         continue;
@@ -365,7 +399,7 @@ pub fn run_dap_server(
                         if Instant::now() > deadline {
                             suppress_stop_event.store(false, Ordering::SeqCst);
                             server.send_event(output_event(
-                                "SetFunctionBreakpoints: timeout waiting for target to halt"
+                                "SetFunctionBreakpoints: timeout waiting for target to halt",
                             ))?;
                             server.respond(req.error("timeout waiting for target to halt"))?;
                             continue 'main;
@@ -376,13 +410,13 @@ pub fn run_dap_server(
                     let drained = adapter.gdb.drain_stale_data();
                     if adapter.verbose && drained > 0 {
                         server.send_event(output_event(&format!(
-                            "SetFunctionBreakpoints: drained {} stale bytes after halt", drained
+                            "SetFunctionBreakpoints: drained {} stale bytes after halt",
+                            drained
                         )))?;
                     }
                 }
 
-                let breakpoints =
-                    adapter.handle_set_function_breakpoints(&args.breakpoints);
+                let breakpoints = adapter.handle_set_function_breakpoints(&args.breakpoints);
                 server.respond(req.success(ResponseBody::SetFunctionBreakpoints(
                     SetFunctionBreakpointsResponse { breakpoints },
                 )))?;
@@ -393,7 +427,8 @@ pub fn run_dap_server(
                     let drained = adapter.gdb.drain_stale_data();
                     if adapter.verbose && drained > 0 {
                         server.send_event(output_event(&format!(
-                            "SetFunctionBreakpoints: drained {} stale bytes before resume", drained
+                            "SetFunctionBreakpoints: drained {} stale bytes before resume",
+                            drained
                         )))?;
                     }
                     match adapter.handle_continue() {
@@ -409,7 +444,6 @@ pub fn run_dap_server(
                                 &adapter.gdb,
                                 &server_output,
                                 &adapter.gdb.target_running_flag(),
-                                &no_ack,
                                 &suppress_stop_event,
                                 adapter.verbose,
                             );
@@ -417,7 +451,8 @@ pub fn run_dap_server(
                         Err(e) => {
                             suppress_stop_event.store(false, Ordering::SeqCst);
                             server.send_event(output_event(&format!(
-                                "SetFunctionBreakpoints: resume failed: {}", e
+                                "SetFunctionBreakpoints: resume failed: {}",
+                                e
                             )))?;
                             server.send_event(stopped_event(StoppedEventReason::Breakpoint))?;
                         }
@@ -426,20 +461,14 @@ pub fn run_dap_server(
             }
 
             Command::SetExceptionBreakpoints(_) => {
-                server.respond(req.success(
-                    ResponseBody::SetExceptionBreakpoints(
-                        SetExceptionBreakpointsResponse {
-                            breakpoints: None,
-                        },
-                    ),
-                ))?;
+                server.respond(req.success(ResponseBody::SetExceptionBreakpoints(
+                    SetExceptionBreakpointsResponse { breakpoints: None },
+                )))?;
             }
 
             Command::Threads => {
                 let threads = adapter.handle_threads();
-                server.respond(req.success(ResponseBody::Threads(ThreadsResponse {
-                    threads,
-                })))?;
+                server.respond(req.success(ResponseBody::Threads(ThreadsResponse { threads })))?;
             }
 
             Command::StackTrace(_args) => {
@@ -452,7 +481,8 @@ pub fn run_dap_server(
                     }
                     Err(e) => {
                         server.send_event(output_event(&format!(
-                            "StackTrace: register read failed: {}", e
+                            "StackTrace: register read failed: {}",
+                            e
                         )))?;
                         server.respond(req.error(&e.to_string()))?;
                         continue;
@@ -479,9 +509,7 @@ pub fn run_dap_server(
                         for msg in adapter.take_step_log() {
                             server.send_event(output_event(&msg))?;
                         }
-                        server.send_event(output_event(&format!(
-                            "StackTrace error: {}", e
-                        )))?;
+                        server.send_event(output_event(&format!("StackTrace error: {}", e)))?;
                         server.respond(req.error(&e.to_string()))?;
                     }
                 }
@@ -489,21 +517,17 @@ pub fn run_dap_server(
 
             Command::Scopes(args) => {
                 let scopes = adapter.handle_scopes(args.frame_id);
-                server.respond(req.success(ResponseBody::Scopes(ScopesResponse {
-                    scopes,
-                })))?;
+                server.respond(req.success(ResponseBody::Scopes(ScopesResponse { scopes })))?;
             }
 
-            Command::Variables(args) => {
-                match adapter.handle_variables(args.variables_reference) {
-                    Ok(variables) => {
-                        server.respond(req.success(ResponseBody::Variables(
-                            VariablesResponse { variables },
-                        )))?;
-                    }
-                    Err(e) => server.respond(req.error(&e.to_string()))?,
+            Command::Variables(args) => match adapter.handle_variables(args.variables_reference) {
+                Ok(variables) => {
+                    server.respond(
+                        req.success(ResponseBody::Variables(VariablesResponse { variables })),
+                    )?;
                 }
-            }
+                Err(e) => server.respond(req.error(&e.to_string()))?,
+            },
 
             Command::Continue(_args) => {
                 if adapter.verbose {
@@ -516,30 +540,26 @@ pub fn run_dap_server(
                 let drained = adapter.gdb.drain_stale_data();
                 if adapter.verbose && drained > 0 {
                     server.send_event(output_event(&format!(
-                        "Drained {} stale bytes before continue", drained
+                        "Drained {} stale bytes before continue",
+                        drained
                     )))?;
                 }
                 match adapter.handle_continue() {
                     Ok(()) => {
-                        server.respond(req.success(ResponseBody::Continue(
-                            ContinueResponse {
-                                all_threads_continued: Some(true),
-                            },
-                        )))?;
+                        server.respond(req.success(ResponseBody::Continue(ContinueResponse {
+                            all_threads_continued: Some(true),
+                        })))?;
                         adapter.gdb.set_target_running(true);
                         start_rsp_monitor(
                             &adapter.gdb,
                             &server_output,
                             &adapter.gdb.target_running_flag(),
-                            &no_ack,
                             &suppress_stop_event,
                             adapter.verbose,
                         );
                     }
                     Err(e) => {
-                        server.send_event(output_event(&format!(
-                            "Continue error: {}", e
-                        )))?;
+                        server.send_event(output_event(&format!("Continue error: {}", e)))?;
                         server.respond(req.error(&e.to_string()))?;
                     }
                 }
@@ -550,9 +570,7 @@ pub fn run_dap_server(
                     server.send_event(output_event("Sending interrupt (0x03)"))?;
                 }
                 if let Err(e) = adapter.gdb.send_interrupt() {
-                    server.send_event(output_event(&format!(
-                        "Interrupt write failed: {}", e
-                    )))?;
+                    server.send_event(output_event(&format!("Interrupt write failed: {}", e)))?;
                 }
                 server.respond(req.success(ResponseBody::Pause))?;
             }
@@ -620,7 +638,8 @@ pub fn run_dap_server(
                 let drained = adapter.gdb.drain_stale_data();
                 if adapter.verbose && drained > 0 {
                     server.send_event(output_event(&format!(
-                        "Drained {} stale bytes before step-out", drained
+                        "Drained {} stale bytes before step-out",
+                        drained
                     )))?;
                 }
                 match adapter.handle_step_out() {
@@ -631,15 +650,12 @@ pub fn run_dap_server(
                             &adapter.gdb,
                             &server_output,
                             &adapter.gdb.target_running_flag(),
-                            &no_ack,
                             &suppress_stop_event,
                             adapter.verbose,
                         );
                     }
                     Err(e) => {
-                        server.send_event(output_event(&format!(
-                            "StepOut error: {}", e
-                        )))?;
+                        server.send_event(output_event(&format!("StepOut error: {}", e)))?;
                         server.respond(req.error(&e.to_string()))?;
                     }
                 }
@@ -683,68 +699,55 @@ fn start_rsp_monitor<W: Write + Send + 'static>(
     gdb: &gdb_client::GDB,
     output: &Arc<Mutex<ServerOutput<W>>>,
     target_running: &Arc<AtomicBool>,
-    no_ack: &Arc<AtomicBool>,
     suppress_stop: &Arc<AtomicBool>,
     verbose: bool,
 ) {
-    let stream = match gdb.try_clone_stream() {
+    let mut gdb_clone = match gdb.try_clone_stream() {
         Ok(s) => s,
         Err(_) => return,
     };
     let output = output.clone();
     let running = target_running.clone();
-    let no_ack = no_ack.clone();
     let suppress_stop = suppress_stop.clone();
 
     std::thread::spawn(move || {
-        // Blocking mode — wait for the one stop-reply we expect.
-        let _ = stream.set_read_timeout(None);
-        let skip_ack = no_ack.load(Ordering::SeqCst);
+        let packet = gdb_clone.read_packet();
+        if let Some(packet) = packet {
+            running.store(false, Ordering::SeqCst);
 
-        let packet = gdb_client::read_packet_from_stream(&stream, skip_ack);
+            if suppress_stop.load(Ordering::SeqCst) {
+                return;
+            }
 
-        // Clear the running flag FIRST so the main thread can resume sending.
-        running.store(false, Ordering::SeqCst);
+            let payload = String::from_utf8_lossy(&packet);
+            let is_stop_reply = matches!(
+                packet.first(),
+                Some(b'T') | Some(b'S') | Some(b'W') | Some(b'X') | Some(b'N')
+            );
 
-        // If suppressed, skip emitting events (transparent halt for breakpoint setting).
-        if suppress_stop.load(Ordering::SeqCst) {
-            return;
-        }
-
-        match packet {
-            Some(packet) => {
-                let payload = String::from_utf8_lossy(&packet);
-                // Validate: RSP stop-replies start with T, S, W, X, or N
-                let is_stop_reply = matches!(
-                    packet.first(),
-                    Some(b'T') | Some(b'S') | Some(b'W') | Some(b'X') | Some(b'N')
-                );
-
-                if let Ok(mut out) = output.lock() {
-                    if is_stop_reply {
-                        if verbose {
-                            let _ = out.send_event(output_event(
-                                &format!("Target stopped (reply: {})", payload),
-                            ));
-                        }
-                        let _ = out.send_event(stopped_event(StoppedEventReason::Breakpoint));
-                    } else {
-                        // Not a stop-reply — protocol desync detected!
+            if let Ok(mut out) = output.lock() {
+                if is_stop_reply {
+                    if verbose {
                         let _ = out.send_event(output_event(&format!(
-                            "RSP DESYNC: expected stop-reply, got: {} (len={}, first=0x{:02x})",
-                            &payload[..payload.len().min(40)],
-                            payload.len(),
-                            packet.first().copied().unwrap_or(0),
+                            "Target stopped (reply: {})",
+                            payload
                         )));
-                        // Still send Stopped so the UI doesn't hang, but with a reason
-                        let _ = out.send_event(stopped_event(StoppedEventReason::Exception));
                     }
+                    let _ = out.send_event(stopped_event(StoppedEventReason::Breakpoint));
+                } else {
+                    let _ = out.send_event(output_event(&format!(
+                        "RSP DESYNC: expected stop-reply, got: {} (len={}, first=0x{:02x})",
+                        &payload[..payload.len().min(40)],
+                        payload.len(),
+                        packet.first().copied().unwrap_or(0),
+                    )));
+                    let _ = out.send_event(stopped_event(StoppedEventReason::Exception));
                 }
             }
-            None => {
-                if let Ok(mut out) = output.lock() {
-                    let _ = out.send_event(output_event("RSP monitor: connection lost or error"));
-                }
+        } else {
+            running.store(false, Ordering::SeqCst);
+            if let Ok(mut out) = output.lock() {
+                let _ = out.send_event(output_event("RSP monitor: connection lost or error"));
             }
         }
     });

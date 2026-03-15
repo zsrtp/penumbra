@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 thiserror = "2.0.18"
+serialport = "4"
 
 [dev-dependencies]
 object = { version = "0.36", default-features = false, features = ["read", "elf"] }

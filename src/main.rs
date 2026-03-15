@@ -29,14 +29,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     if args.dap {
-        let program = args
-            .program
-            .as_deref()
-            .unwrap_or("");
-        let target = args
-            .target
-            .as_deref()
-            .unwrap_or("127.0.0.1:2159");
+        let program = args.program.as_deref().unwrap_or("");
+        let target = args.target.as_deref().unwrap_or("127.0.0.1:2159");
         let debug_info = args.debug_info.as_deref();
 
         dap::run_dap_server(program, debug_info, target)?;

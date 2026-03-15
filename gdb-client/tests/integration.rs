@@ -13,7 +13,7 @@
 //!
 //! All tests are `#[ignore]` so `cargo test` doesn't accidentally try to connect.
 
-use gdb_client::{GDBCmd, GDBSource, GDB};
+use gdb_client::{GDB, GDBCmd, GDBSource};
 use std::net::IpAddr;
 use std::path::PathBuf;
 
@@ -59,8 +59,9 @@ fn test_target() -> Option<(IpAddr, u16)> {
 
 fn connect() -> GDB {
     let (ip, port) = test_target().expect("GDB_TEST_HOST not set (e.g. 192.168.1.100:2159)");
-    let mut gdb = GDB::new(GDBSource::Network((ip, port)));
-    gdb.execute_cmd(GDBCmd::Connect).expect("failed to connect");
+    let mut gdb = GDB::new();
+    gdb.execute_cmd(GDBCmd::Connect(GDBSource::Network((ip, port))))
+        .expect("failed to connect");
     gdb
 }
 
@@ -72,8 +73,7 @@ fn connect_noack() -> GDB {
 }
 
 fn test_elf_path() -> PathBuf {
-    let path = std::env::var("GDB_TEST_ELF")
-        .expect("GDB_TEST_ELF not set (path to game ELF)");
+    let path = std::env::var("GDB_TEST_ELF").expect("GDB_TEST_ELF not set (path to game ELF)");
     PathBuf::from(path)
 }
 
@@ -117,13 +117,141 @@ fn connect_and_halt() {
 #[ignore]
 fn connect_and_init() {
     let (ip, port) = test_target().expect("GDB_TEST_HOST not set");
-    let mut gdb = GDB::new(GDBSource::Network((ip, port)));
-    gdb.execute_cmd(GDBCmd::ConnectAndInit)
+    let mut gdb = GDB::new();
+    gdb.execute_cmd(GDBCmd::ConnectAndInit(GDBSource::Network((ip, port))))
         .expect("connect_and_init failed");
-    assert!(gdb.is_no_ack_mode(), "no-ack mode should be active after init");
+    assert!(
+        gdb.is_no_ack_mode(),
+        "no-ack mode should be active after init"
+    );
     let regs = gdb.read_registers().expect("read regs failed");
     assert!(regs.pc >= 0x80000000, "PC out of range: 0x{:08x}", regs.pc);
     gdb.detach().expect("detach failed");
+}
+
+fn serial_source() -> Option<GDBSource> {
+    let path = std::env::var("GDB_TEST_SERIAL").ok()?;
+    let baud: u32 = std::env::var("GDB_TEST_SERIAL_BAUD")
+        .unwrap_or_else(|_| "115200".to_string())
+        .parse()
+        .ok()?;
+    Some(GDBSource::Serial {
+        path: std::path::PathBuf::from(path),
+        baud_rate: baud,
+    })
+}
+
+fn connect_serial() -> GDB {
+    let source = serial_source().expect("GDB_TEST_SERIAL not set (e.g. /dev/ttyUSB0)");
+    let mut gdb = GDB::new();
+    gdb.execute_cmd(GDBCmd::Connect(source))
+        .expect("failed to connect");
+    gdb
+}
+
+fn connect_serial_noack() -> GDB {
+    let mut gdb = connect_serial();
+    gdb.query_stop_reason().expect("initial halt failed");
+    gdb.negotiate().expect("negotiate failed");
+    gdb
+}
+
+// ── Serial Connection ─────────────────────────────────────────────────────────
+
+#[test]
+#[ignore]
+fn serial_connect_and_halt() {
+    let mut gdb = connect_serial();
+    let reply = gdb.query_stop_reason().expect("? command failed");
+    assert!(
+        reply.signal == 2 || reply.signal == 5,
+        "unexpected signal: {}",
+        reply.signal,
+    );
+    gdb.detach().expect("detach failed");
+}
+
+#[test]
+#[ignore]
+fn serial_connect_and_init() {
+    let source = serial_source().expect("GDB_TEST_SERIAL not set");
+    let mut gdb = GDB::new();
+    gdb.execute_cmd(GDBCmd::ConnectAndInit(source))
+        .expect("connect_and_init failed");
+    assert!(
+        gdb.is_no_ack_mode(),
+        "no-ack mode should be active after init"
+    );
+    let regs = gdb.read_registers().expect("read regs failed");
+    assert!(regs.pc >= 0x80000000, "PC out of range: 0x{:08x}", regs.pc);
+    gdb.detach().expect("detach failed");
+}
+
+#[test]
+#[ignore]
+fn serial_clone_and_monitor() {
+    let mut gdb = connect_serial_noack();
+    let no_ack = gdb.is_no_ack_mode();
+
+    gdb.resume().expect("resume failed");
+
+    // Clone the GDB for the monitor thread
+    let mut gdb_clone = gdb.try_clone_stream().expect("clone failed");
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
+    std::thread::spawn(move || {
+        if let Ok(stream) = gdb_clone.get_stream() {
+            let _ = stream.set_nonblocking(false);
+            if let Some(packet) = gdb_client::read_packet_from_stream(&mut *stream, no_ack) {
+                let _ = tx.send(packet);
+            }
+        }
+    });
+
+    // Give target time to run
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    gdb.send_interrupt().expect("interrupt failed");
+
+    // Monitor thread should receive the stop-reply
+    let packet = rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("monitor didn't receive stop-reply");
+    assert!(
+        packet.starts_with(b"T") || packet.starts_with(b"S"),
+        "expected stop-reply, got {:?}",
+        String::from_utf8_lossy(&packet[..packet.len().min(20)]),
+    );
+}
+
+#[test]
+#[ignore]
+fn serial_clone_preserves_connection() {
+    let mut gdb = connect_serial();
+
+    // Clone the GDB
+    let gdb_clone = gdb.clone();
+
+    // Both should still be connected (check state)
+    assert_eq!(gdb.state, gdb_clone.state);
+    assert!(matches!(gdb.state, gdb_client::GDBState::Connected));
+
+    // The original should be able to query
+    let reply = gdb.query_stop_reason().expect("query failed");
+    assert!(reply.signal == 2 || reply.signal == 5);
+
+    gdb.detach().expect("detach failed");
+}
+
+#[test]
+#[ignore]
+fn serial_read_registers() {
+    let mut gdb = connect_serial_noack();
+    let regs = gdb.read_registers().expect("read_registers failed");
+    let sp = regs.gpr[1];
+    assert!(
+        sp >= 0x80000000 && sp <= 0x817FFFFF,
+        "SP out of range: 0x{:08x}",
+        sp,
+    );
 }
 
 #[test]
@@ -170,7 +298,11 @@ fn register_read_all() {
 fn register_blob_size() {
     let mut gdb = connect_noack();
     let regs = gdb.read_registers().expect("read_registers failed");
-    eprintln!("{:?} register blob size: {} bytes", target(), regs.reg_blob_size);
+    eprintln!(
+        "{:?} register blob size: {} bytes",
+        target(),
+        regs.reg_blob_size
+    );
     // Both stubs return at least GPRs + FPRs + specials (>= 392 bytes)
     assert!(
         regs.reg_blob_size >= 392,
@@ -221,11 +353,23 @@ fn register_g_vs_p_consistency() {
     let mut gdb = connect_noack();
     let regs = gdb.read_registers().expect("g failed");
     let sp_p = gdb.read_register(1).expect("p1 failed") as u32;
-    assert_eq!(regs.gpr[1], sp_p, "SP mismatch: g=0x{:08x} vs p=0x{:08x}", regs.gpr[1], sp_p);
+    assert_eq!(
+        regs.gpr[1], sp_p,
+        "SP mismatch: g=0x{:08x} vs p=0x{:08x}",
+        regs.gpr[1], sp_p
+    );
     let pc_p = gdb.read_register(64).expect("p40 failed") as u32;
-    assert_eq!(regs.pc, pc_p, "PC mismatch: g=0x{:08x} vs p=0x{:08x}", regs.pc, pc_p);
+    assert_eq!(
+        regs.pc, pc_p,
+        "PC mismatch: g=0x{:08x} vs p=0x{:08x}",
+        regs.pc, pc_p
+    );
     let lr_p = gdb.read_register(67).expect("p43 failed") as u32;
-    assert_eq!(regs.lr, lr_p, "LR mismatch: g=0x{:08x} vs p=0x{:08x}", regs.lr, lr_p);
+    assert_eq!(
+        regs.lr, lr_p,
+        "LR mismatch: g=0x{:08x} vs p=0x{:08x}",
+        regs.lr, lr_p
+    );
     gdb.detach().expect("detach failed");
 }
 
@@ -275,7 +419,11 @@ fn breakpoint_hit() {
     let addr = bp_addr();
     gdb.set_breakpoint(addr).expect("set BP failed");
     let reply = gdb.continue_and_wait().expect("continue_and_wait failed");
-    assert_eq!(reply.signal, 5, "expected SIGTRAP (5), got {}", reply.signal);
+    assert_eq!(
+        reply.signal, 5,
+        "expected SIGTRAP (5), got {}",
+        reply.signal
+    );
     let regs = gdb.read_registers().expect("read regs failed");
     assert_eq!(regs.pc, addr, "PC should be at breakpoint");
     gdb.remove_breakpoint(addr).expect("remove BP failed");
@@ -289,7 +437,9 @@ fn breakpoint_continue_multiple() {
     let addr = bp_addr();
     gdb.set_breakpoint(addr).expect("set BP failed");
     for i in 0..5 {
-        let reply = gdb.continue_and_wait().expect(&format!("continue {} failed", i));
+        let reply = gdb
+            .continue_and_wait()
+            .expect(&format!("continue {} failed", i));
         assert_eq!(reply.signal, 5, "iteration {}: expected SIGTRAP", i);
         let regs = gdb.read_registers().expect("read regs failed");
         assert_eq!(regs.pc, addr, "iteration {}: PC mismatch", i);
@@ -306,7 +456,11 @@ fn breakpoint_remove_restores_instruction() {
     let orig = gdb.read_memory(addr, 4).expect("read original failed");
     gdb.set_breakpoint(addr).expect("set BP failed");
     let trapped = gdb.read_memory(addr, 4).expect("read trap failed");
-    assert_eq!(trapped, &[0x7F, 0xE0, 0x00, 0x08], "expected trap instruction");
+    assert_eq!(
+        trapped,
+        &[0x7F, 0xE0, 0x00, 0x08],
+        "expected trap instruction"
+    );
     gdb.remove_breakpoint(addr).expect("remove BP failed");
     let restored = gdb.read_memory(addr, 4).expect("read restored failed");
     assert_eq!(restored, orig, "instruction not restored");
@@ -334,7 +488,9 @@ fn interrupt_stops_running_target() {
     );
 
     // Should be able to read registers after interrupt
-    let regs = gdb.read_registers().expect("read regs after interrupt failed");
+    let regs = gdb
+        .read_registers()
+        .expect("read regs after interrupt failed");
     assert!(regs.pc >= 0x80000000, "PC out of range: 0x{:08x}", regs.pc);
     gdb.detach().expect("detach failed");
 }
@@ -348,14 +504,18 @@ fn interrupt_resume_cycle() {
     for i in 0..5 {
         gdb.resume().expect(&format!("resume {} failed", i));
         std::thread::sleep(std::time::Duration::from_millis(100));
-        gdb.send_interrupt().expect(&format!("interrupt {} failed", i));
+        gdb.send_interrupt()
+            .expect(&format!("interrupt {} failed", i));
         let reply = gdb.wait_stop().expect(&format!("wait_stop {} failed", i));
         assert!(
             reply.signal == 2 || reply.signal == 5,
             "iteration {}: unexpected signal {}",
-            i, reply.signal,
+            i,
+            reply.signal,
         );
-        let regs = gdb.read_registers().expect(&format!("read regs {} failed", i));
+        let regs = gdb
+            .read_registers()
+            .expect(&format!("read regs {} failed", i));
         assert!(regs.pc >= 0x80000000, "iter {}: PC out of range", i);
     }
 
@@ -434,11 +594,11 @@ fn monitor_pattern_stack_walk() {
         gdb.resume().expect("resume failed");
 
         // Read stop-reply from a cloned stream using the shared function
-        let clone = gdb.try_clone_stream().expect("clone failed");
+        let mut clone = gdb.try_clone_tcp_stream().expect("clone failed");
         clone
             .set_read_timeout(Some(std::time::Duration::from_secs(10)))
             .unwrap();
-        let packet = gdb_client::read_packet_from_stream(&clone, no_ack);
+        let packet = gdb_client::read_packet_from_stream(&mut clone, no_ack);
         drop(clone);
 
         let payload = packet.expect(&format!("iter {}: no packet received", i));
@@ -455,7 +615,9 @@ fn monitor_pattern_stack_walk() {
         assert_eq!(stop.signal, 5, "iter {}: expected SIGTRAP", i);
 
         // Use main socket for reads (simulates DAP handler after monitor sets running=false)
-        let regs = gdb.read_registers().expect(&format!("iter {}: read regs failed", i));
+        let regs = gdb
+            .read_registers()
+            .expect(&format!("iter {}: read regs failed", i));
         assert_eq!(regs.pc, addr, "iter {}: PC mismatch", i);
         let (depth, clean) = walk_stack(&mut gdb, regs.gpr[1]);
         assert!(clean, "iter {}: stack walk not clean (depth {})", i, depth);
@@ -477,21 +639,23 @@ fn monitor_interrupt_pattern() {
         gdb.resume().expect(&format!("resume {} failed", i));
 
         // Spawn a monitor thread (like gui.rs gdb_thread does)
-        let clone = gdb.try_clone_stream().expect("clone failed");
+        let mut clone = gdb.try_clone_tcp_stream().expect("clone failed");
         let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
         std::thread::spawn(move || {
             let _ = clone.set_read_timeout(Some(std::time::Duration::from_secs(10)));
-            if let Some(packet) = gdb_client::read_packet_from_stream(&clone, no_ack) {
+            if let Some(packet) = gdb_client::read_packet_from_stream(&mut clone, no_ack) {
                 let _ = tx.send(packet);
             }
         });
 
         // Give target time to run, then interrupt
         std::thread::sleep(std::time::Duration::from_millis(100));
-        gdb.send_interrupt().expect(&format!("interrupt {} failed", i));
+        gdb.send_interrupt()
+            .expect(&format!("interrupt {} failed", i));
 
         // Monitor thread should receive the stop-reply
-        let packet = rx.recv_timeout(std::time::Duration::from_secs(5))
+        let packet = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
             .expect(&format!("iter {}: monitor didn't receive stop-reply", i));
         assert!(
             packet.starts_with(b"T") || packet.starts_with(b"S"),
@@ -501,7 +665,9 @@ fn monitor_interrupt_pattern() {
         );
 
         // Main socket should work for commands now
-        let regs = gdb.read_registers().expect(&format!("iter {}: read regs failed", i));
+        let regs = gdb
+            .read_registers()
+            .expect(&format!("iter {}: read regs failed", i));
         assert!(regs.pc >= 0x80000000, "iter {}: PC out of range", i);
     }
 
@@ -517,8 +683,8 @@ fn monitor_interrupt_pattern() {
 #[test]
 #[ignore]
 fn set_breakpoint_while_running() {
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     let mut gdb = connect_noack();
     let addr = bp_addr();
@@ -530,12 +696,12 @@ fn set_breakpoint_while_running() {
     target_running.store(true, Ordering::SeqCst);
 
     // Spawn a monitor thread (same pattern as start_rsp_monitor)
-    let clone = gdb.try_clone_stream().expect("clone failed");
+    let mut clone = gdb.try_clone_tcp_stream().expect("clone failed");
     let running = target_running.clone();
     let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
     std::thread::spawn(move || {
         let _ = clone.set_read_timeout(None);
-        if let Some(packet) = gdb_client::read_packet_from_stream(&clone, no_ack) {
+        if let Some(packet) = gdb_client::read_packet_from_stream(&mut clone, no_ack) {
             // Clear running flag FIRST (same as start_rsp_monitor)
             running.store(false, Ordering::SeqCst);
             let _ = tx.send(packet);
@@ -547,7 +713,10 @@ fn set_breakpoint_while_running() {
 
     // Now simulate SetBreakpoints while running:
     // 1. Check target is running
-    assert!(target_running.load(Ordering::SeqCst), "target should be running");
+    assert!(
+        target_running.load(Ordering::SeqCst),
+        "target should be running"
+    );
 
     // 2. Send interrupt
     gdb.send_interrupt().expect("interrupt failed");
@@ -563,7 +732,8 @@ fn set_breakpoint_while_running() {
     }
 
     // Monitor should have received the stop-reply
-    let packet = rx.recv_timeout(std::time::Duration::from_secs(1))
+    let packet = rx
+        .recv_timeout(std::time::Duration::from_secs(1))
         .expect("monitor didn't receive stop-reply");
     assert!(
         packet.starts_with(b"T") || packet.starts_with(b"S"),
@@ -576,7 +746,8 @@ fn set_breakpoint_while_running() {
     gdb.drain_stale_data();
 
     // 5. Set breakpoint while halted
-    gdb.set_breakpoint(addr).expect("set BP failed (while halted after interrupt)");
+    gdb.set_breakpoint(addr)
+        .expect("set BP failed (while halted after interrupt)");
 
     // 6. Resume
     gdb.resume().expect("resume after BP set failed");
@@ -598,15 +769,18 @@ fn set_breakpoint_while_running() {
 #[ignore]
 fn set_breakpoint_while_stopped_no_halt() {
     skip_on!(Target::Dolphin);
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     let mut gdb = connect_noack();
     let addr = bp_addr();
     let target_running = Arc::new(AtomicBool::new(false));
 
     // Target is stopped (just connected). needs_halt should be false.
-    assert!(!target_running.load(Ordering::SeqCst), "target should be stopped");
+    assert!(
+        !target_running.load(Ordering::SeqCst),
+        "target should be stopped"
+    );
 
     // Set breakpoint directly — no halt needed.
     gdb.set_breakpoint(addr).expect("set BP failed");
@@ -635,25 +809,33 @@ fn set_breakpoint_while_running_cycle() {
         std::thread::sleep(std::time::Duration::from_millis(100));
 
         // Halt
-        gdb.send_interrupt().expect(&format!("interrupt {} failed", i));
+        gdb.send_interrupt()
+            .expect(&format!("interrupt {} failed", i));
         let reply = gdb.wait_stop().expect(&format!("wait_stop {} failed", i));
         assert!(
             reply.signal == 2 || reply.signal == 5,
             "iter {}: unexpected signal {}",
-            i, reply.signal,
+            i,
+            reply.signal,
         );
 
         // Set breakpoint while halted
-        gdb.set_breakpoint(addr).expect(&format!("set BP {} failed", i));
+        gdb.set_breakpoint(addr)
+            .expect(&format!("set BP {} failed", i));
 
         // Resume — should hit BP
-        let reply = gdb.continue_and_wait().expect(&format!("continue {} failed", i));
+        let reply = gdb
+            .continue_and_wait()
+            .expect(&format!("continue {} failed", i));
         assert_eq!(reply.signal, 5, "iter {}: expected SIGTRAP", i);
-        let regs = gdb.read_registers().expect(&format!("read regs {} failed", i));
+        let regs = gdb
+            .read_registers()
+            .expect(&format!("read regs {} failed", i));
         assert_eq!(regs.pc, addr, "iter {}: PC mismatch", i);
 
         // Remove and continue cycle
-        gdb.remove_breakpoint(addr).expect(&format!("remove BP {} failed", i));
+        gdb.remove_breakpoint(addr)
+            .expect(&format!("remove BP {} failed", i));
     }
 
     gdb.detach().expect("detach failed");
