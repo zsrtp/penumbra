@@ -121,6 +121,7 @@ impl Stream {
                 let addr = std::net::SocketAddr::new(*ip, *port);
                 let stream = TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(5))?;
                 stream.set_nonblocking(false)?;
+                stream.set_nodelay(true)?;
                 Ok(Stream::Tcp(stream, addr))
             }
             GDBSource::Serial { path, baud_rate } => {
