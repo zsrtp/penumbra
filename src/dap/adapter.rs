@@ -1,20 +1,36 @@
+//! DAP <-> GDB translation layer.
+//!
+//! Translates Debug Adapter Protocol requests into GDB RSP commands.
+
 use std::collections::HashMap;
 use std::path::Path;
 
 use dap::types::*;
-use gdb_client::{GDBError, GDBSource, PpcRegisters, GDB};
+use gdb_client::{GDB, GDBError, GDBSource, PpcRegisters};
 
 use super::symbols::{SymbolResolver, VarLocation};
 
+/// Variable reference types for DAP's evaluate request.
 const VAR_REF_GPR: i64 = 1;
 const VAR_REF_FPR: i64 = 2;
 const VAR_REF_SPECIAL: i64 = 3;
 const VAR_REF_LOCALS: i64 = 4;
 
+/// Maximum stack depth to fetch.
 const MAX_STACK_DEPTH: usize = 64;
 
+/// Main adapter state machine.
+///
+/// This struct bridges DAP (Debug Adapter Protocol) with GDB RSP.
+/// It maintains:
+/// - GDB client connection
+/// - Breakpoint state
+/// - Cached register values
+/// - Symbol resolver for source-level debugging
 pub struct DebugAdapter {
+    /// The GDB client instance.
     pub gdb: GDB,
+    /// Symbol resolver for source file/line to address mapping.
     symbols: Option<SymbolResolver>,
     /// Active breakpoints: address → source info.
     breakpoints: HashMap<u32, BreakpointInfo>,
@@ -67,10 +83,7 @@ impl DebugAdapter {
 
     /// Connect to RSP target + load symbols.
     /// `args` is the raw JSON value from the attach request.
-    pub fn handle_attach(
-        &mut self,
-        args: &serde_json::Value,
-    ) -> Result<(), String> {
+    pub fn handle_attach(&mut self, args: &serde_json::Value) -> Result<(), String> {
         let target = args
             .get("target")
             .and_then(|v| v.as_str())
@@ -80,26 +93,23 @@ impl DebugAdapter {
             .and_then(|v| v.as_str())
             .ok_or("missing 'program' in attach args")?;
         let debug_info = args.get("debugInfo").and_then(|v| v.as_str());
-        self.verbose = args.get("verbose").and_then(|v| v.as_bool()).unwrap_or(false);
+        self.verbose = args
+            .get("verbose")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         // Parse target as ip:port
-        let (ip_str, port_str) = target
-            .rsplit_once(':')
-            .ok_or("target must be ip:port")?;
-        let ip: std::net::IpAddr = ip_str
-            .parse()
-            .map_err(|e| format!("bad IP: {}", e))?;
-        let port: u16 = port_str
-            .parse()
-            .map_err(|e| format!("bad port: {}", e))?;
+        let (ip_str, port_str) = target.rsplit_once(':').ok_or("target must be ip:port")?;
+        let ip: std::net::IpAddr = ip_str.parse().map_err(|e| format!("bad IP: {}", e))?;
+        let port: u16 = port_str.parse().map_err(|e| format!("bad port: {}", e))?;
 
         // Connect + query_stop_reason + negotiate in one step.
         // Nintendont defers installing the PPC exception handler (MAGIC/HALT_REQ)
         // until '?' is received, so connect_and_init() must happen before
         // setting breakpoints.
-        self.gdb.source = Some(GDBSource::Network((ip, port)));
+        let source = GDBSource::Network((ip, port));
         self.gdb
-            .execute_cmd(gdb_client::GDBCmd::ConnectAndInit)
+            .execute_cmd(gdb_client::GDBCmd::ConnectAndInit(source))
             .map_err(|e| e.to_string())?;
 
         // Derive project root from program path (e.g. /path/to/project/build/GZ2E01/framework.elf → /path/to/project)
@@ -219,12 +229,8 @@ impl DebugAdapter {
             if let Some(addr) = resolved {
                 let ok = self.gdb.set_breakpoint(addr).is_ok();
                 if ok {
-                    self.breakpoints.insert(
-                        addr,
-                        BreakpointInfo {
-                            source_file: None,
-                        },
-                    );
+                    self.breakpoints
+                        .insert(addr, BreakpointInfo { source_file: None });
                 }
                 results.push(Breakpoint {
                     verified: ok,
@@ -264,7 +270,9 @@ impl DebugAdapter {
         // Read current instruction
         let insn_data = self.gdb.read_memory(pc, 4)?;
         if insn_data.len() < 4 {
-            return Err(GDBError::InvalidResponse("short memory read for insn".into()));
+            return Err(GDBError::InvalidResponse(
+                "short memory read for insn".into(),
+            ));
         }
         let insn = u32::from_be_bytes([insn_data[0], insn_data[1], insn_data[2], insn_data[3]]);
 
@@ -393,10 +401,8 @@ impl DebugAdapter {
 
             let new_pc = self.cached_regs.as_ref().map(|r| r.pc).unwrap_or(0);
             let cur_loc = self.current_source_line();
-            self.step_log.push(format!(
-                "[next]   -> pc=0x{:08x} loc={:?}",
-                new_pc, cur_loc
-            ));
+            self.step_log
+                .push(format!("[next]   -> pc=0x{:08x} loc={:?}", new_pc, cur_loc));
 
             match cur_loc {
                 Some(ref loc) if *loc == start_loc => {}
@@ -538,17 +544,20 @@ impl DebugAdapter {
             Ok(data) if data.len() >= 4 => {
                 current_sp = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
                 self.step_log.push(format!(
-                    "[bt] back chain: [0x{:08x}] → 0x{:08x}", sp, current_sp
+                    "[bt] back chain: [0x{:08x}] → 0x{:08x}",
+                    sp, current_sp
                 ));
             }
             Err(e) => {
                 self.step_log.push(format!(
-                    "[bt] FAILED read back chain at 0x{:08x}: {}", current_sp, e
+                    "[bt] FAILED read back chain at 0x{:08x}: {}",
+                    current_sp, e
                 ));
                 return Ok(frames);
             }
             _ => {
-                self.step_log.push("[bt] short read for back chain".to_string());
+                self.step_log
+                    .push("[bt] short read for back chain".to_string());
                 return Ok(frames);
             }
         }
@@ -565,27 +574,25 @@ impl DebugAdapter {
                 }
                 Err(e) => {
                     self.step_log.push(format!(
-                        "[bt] FAILED read back chain at 0x{:08x}: {}", current_sp, e
+                        "[bt] FAILED read back chain at 0x{:08x}: {}",
+                        current_sp, e
                     ));
                     break;
                 }
                 _ => {
-                    self.step_log.push(format!(
-                        "[bt] short read at 0x{:08x}", current_sp
-                    ));
+                    self.step_log
+                        .push(format!("[bt] short read at 0x{:08x}", current_sp));
                     break;
                 }
             };
             if prev_sp == 0 {
-                self.step_log.push(format!(
-                    "[bt] end: [0x{:08x}] = 0", current_sp
-                ));
+                self.step_log
+                    .push(format!("[bt] end: [0x{:08x}] = 0", current_sp));
                 break;
             }
             if prev_sp == current_sp {
-                self.step_log.push(format!(
-                    "[bt] stuck: [0x{:08x}] = same", current_sp
-                ));
+                self.step_log
+                    .push(format!("[bt] stuck: [0x{:08x}] = same", current_sp));
                 break;
             }
 
@@ -597,7 +604,9 @@ impl DebugAdapter {
                 }
                 Err(e) => {
                     self.step_log.push(format!(
-                        "[bt] FAILED read LR at 0x{:08x}: {}", prev_sp + 4, e
+                        "[bt] FAILED read LR at 0x{:08x}: {}",
+                        prev_sp + 4,
+                        e
                     ));
                     break;
                 }
@@ -901,14 +910,14 @@ impl DebugAdapter {
 
 fn format_var_value(raw: u64, var_type: &super::symbols::VarType) -> String {
     match var_type.encoding {
-        e if e == gimli::DW_ATE_signed || e == gimli::DW_ATE_signed_char => match var_type
-            .byte_size
-        {
-            1 => format!("{}", raw as i8),
-            2 => format!("{}", raw as i16),
-            4 => format!("{}", raw as i32),
-            _ => format!("0x{:x}", raw),
-        },
+        e if e == gimli::DW_ATE_signed || e == gimli::DW_ATE_signed_char => {
+            match var_type.byte_size {
+                1 => format!("{}", raw as i8),
+                2 => format!("{}", raw as i16),
+                4 => format!("{}", raw as i32),
+                _ => format!("0x{:x}", raw),
+            }
+        }
         e if e == gimli::DW_ATE_float => format_float_value(raw, var_type.byte_size),
         e if e == gimli::DW_ATE_unsigned_char => {
             let ch = raw as u8;
@@ -966,11 +975,7 @@ pub(crate) fn ppc_step_targets(pc: u32, insn: u32, lr: u32, ctr: u32) -> Vec<u32
             if li & 0x0200_0000 != 0 {
                 li |= 0xFC00_0000;
             }
-            let target = if aa != 0 {
-                li
-            } else {
-                pc.wrapping_add(li)
-            };
+            let target = if aa != 0 { li } else { pc.wrapping_add(li) };
             vec![target]
         }
 
@@ -982,11 +987,7 @@ pub(crate) fn ppc_step_targets(pc: u32, insn: u32, lr: u32, ctr: u32) -> Vec<u32
             if bd & 0x0000_8000 != 0 {
                 bd |= 0xFFFF_0000;
             }
-            let target = if aa != 0 {
-                bd
-            } else {
-                pc.wrapping_add(bd)
-            };
+            let target = if aa != 0 { bd } else { pc.wrapping_add(bd) };
             // BO=20 (0b10100) means "always" — unconditional
             if bo & 0x14 == 0x14 {
                 vec![target]
@@ -1063,10 +1064,7 @@ mod tests {
     fn step_b_forward() {
         // b +0x100 (opcode 18, AA=0, LK=0)
         let insn: u32 = 0x48000100;
-        assert_eq!(
-            ppc_step_targets(0x80001000, insn, 0, 0),
-            vec![0x80001100]
-        );
+        assert_eq!(ppc_step_targets(0x80001000, insn, 0, 0), vec![0x80001100]);
     }
 
     #[test]
@@ -1074,30 +1072,21 @@ mod tests {
         // b -0x100 (sign-extended negative offset)
         let li: u32 = (-0x100i32 as u32) & 0x03FF_FFFC;
         let insn: u32 = (18 << 26) | li;
-        assert_eq!(
-            ppc_step_targets(0x80001000, insn, 0, 0),
-            vec![0x80000F00]
-        );
+        assert_eq!(ppc_step_targets(0x80001000, insn, 0, 0), vec![0x80000F00]);
     }
 
     #[test]
     fn step_bl_is_still_single_target() {
         // bl +0x200 (opcode 18, LK=1 — call, but still unconditional)
         let insn: u32 = 0x48000201;
-        assert_eq!(
-            ppc_step_targets(0x80001000, insn, 0, 0),
-            vec![0x80001200]
-        );
+        assert_eq!(ppc_step_targets(0x80001000, insn, 0, 0), vec![0x80001200]);
     }
 
     #[test]
     fn step_b_absolute() {
         // ba 0x3000 (opcode 18, AA=1, LI=0x3000)
         let insn: u32 = (18 << 26) | 0x3000 | 0b10;
-        assert_eq!(
-            ppc_step_targets(0x80001000, insn, 0, 0),
-            vec![0x00003000]
-        );
+        assert_eq!(ppc_step_targets(0x80001000, insn, 0, 0), vec![0x00003000]);
     }
 
     #[test]
@@ -1114,10 +1103,7 @@ mod tests {
     fn step_bc_unconditional_one_target() {
         // bc 20,0, +0x20 (BO=20=0b10100, "always" — unconditional)
         let insn: u32 = (16 << 26) | (20 << 21) | 0x0020;
-        assert_eq!(
-            ppc_step_targets(0x80001000, insn, 0, 0),
-            vec![0x80001020]
-        );
+        assert_eq!(ppc_step_targets(0x80001000, insn, 0, 0), vec![0x80001020]);
     }
 
     #[test]
@@ -1181,10 +1167,7 @@ mod tests {
     fn step_opcode19_unknown_xo() {
         // opcode 19 with unrecognized XO — should fall through to pc+4
         let insn: u32 = (19 << 26) | (20 << 21) | (999 << 1);
-        assert_eq!(
-            ppc_step_targets(0x80001000, insn, 0, 0),
-            vec![0x80001004]
-        );
+        assert_eq!(ppc_step_targets(0x80001000, insn, 0, 0), vec![0x80001004]);
     }
 
     // ── is_call_instruction ─────────────────────────────────────────────
@@ -1295,10 +1278,6 @@ mod tests {
 fn demangle(name: &str) -> String {
     // Try MW/CodeWarrior demangling first (GameCube/Wii), then Itanium
     cwdemangle::demangle(name, &cwdemangle::DemangleOptions::default())
-        .or_else(|| {
-            cpp_demangle::Symbol::new(name)
-                .map(|s| s.to_string())
-                .ok()
-        })
+        .or_else(|| cpp_demangle::Symbol::new(name).map(|s| s.to_string()).ok())
         .unwrap_or_else(|| name.to_string())
 }

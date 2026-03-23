@@ -1,16 +1,31 @@
+//! GUI application with GDB debugger integration.
+//!
+//! This module provides the GUI thread that manages GDB connections
+//! and handles user interactions.
+
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use flume::{Receiver, Sender};
-use gdb_client::{GDB, GDBCmd, GDBResponse, GDBSource};
+use gdb_client::{GDB, GDBCmd, GDBConnectResult, GDBResponse, GDBSource};
 
+/// GDB event loop running in a dedicated thread.
+///
+/// This function runs the GDB client in a separate thread from the GUI.
+/// Communication happens via channels:
+/// - `app_to_gdb`: Commands from GUI to GDB
+/// - `gdb_to_app`: Responses from GDB to GUI
+///
+/// The thread handles:
+/// - Synchronous and asynchronous connection (TCP/serial)
+/// - Command execution with proper error handling
+/// - Monitor thread spawning for async stop detection when target runs
 pub fn gdb_thread(app_to_gdb: Receiver<GDBCmd>, gdb_to_app: Sender<GDBResponse>) {
     let mut gdb = GDB::default();
     let target_running = Arc::new(AtomicBool::new(false));
 
-    // Pending async TCP connect — dropped to cancel on new connect/disconnect.
-    type ConnectRx = std::sync::mpsc::Receiver<Result<std::net::TcpStream, std::io::Error>>;
+    type ConnectRx = std::sync::mpsc::Receiver<Result<GDB, gdb_client::GDBError>>;
     let mut pending_connect: Option<ConnectRx> = None;
 
     loop {
@@ -20,15 +35,14 @@ pub fn gdb_thread(app_to_gdb: Receiver<GDBCmd>, gdb_to_app: Sender<GDBResponse>)
         if let Some(ref rx) = pending_connect {
             // Check if the TCP connect finished
             match rx.try_recv() {
-                Ok(Ok(stream)) => {
+                Ok(Ok(new_gdb)) => {
                     pending_connect = None;
-                    gdb.attach_stream(stream);
+                    gdb = new_gdb;
                     match gdb.connect_and_init() {
                         Ok(_) => {
                             let _ = gdb_to_app.send(GDBResponse::Connected);
                         }
                         Err(e) => {
-                            let _ = gdb.execute_cmd(GDBCmd::Disconnect);
                             let _ = gdb_to_app.send(GDBResponse::Error(e.to_string()));
                         }
                     }
@@ -82,23 +96,45 @@ pub fn gdb_thread(app_to_gdb: Receiver<GDBCmd>, gdb_to_app: Sender<GDBResponse>)
         }
 
         // Async connect: spawn TCP connect in background thread
-        if matches!(cmd, GDBCmd::ConnectAndInit) {
-            match gdb.target_addr() {
-                Some(addr) => {
-                    let (tx, rx) = std::sync::mpsc::channel();
-                    std::thread::spawn(move || {
-                        let result = std::net::TcpStream::connect_timeout(
-                            &addr,
-                            std::time::Duration::from_secs(5),
-                        );
-                        let _ = tx.send(result);
-                    });
-                    pending_connect = Some(rx);
-                    continue;
+        if let GDBCmd::ConnectAndInit(source) = &cmd {
+            let is_serial = matches!(source, GDBSource::Serial { .. });
+            if is_serial {
+                match gdb.execute_cmd(GDBCmd::ConnectAndInit(source.clone())) {
+                    Ok(GDBResponse::Connected) => {
+                        let _ = gdb_to_app.send(GDBResponse::Connected);
+                    }
+                    Ok(resp) => {
+                        let _ = gdb_to_app.send(resp);
+                    }
+                    Err(e) => {
+                        let _ = gdb.execute_cmd(GDBCmd::Disconnect);
+                        let _ = gdb_to_app.send(GDBResponse::Error(e.to_string()));
+                    }
                 }
-                None => {
-                    let _ = gdb_to_app.send(GDBResponse::Error("no target configured".into()));
-                    continue;
+                continue;
+            }
+            if let GDBSource::Network((_ip, _port)) = source {
+                match GDB::connect_async(source) {
+                    GDBConnectResult::InProgress(rx) => {
+                        pending_connect = Some(rx);
+                        continue;
+                    }
+                    GDBConnectResult::Connected(new_gdb) => {
+                        gdb = new_gdb;
+                        match gdb.connect_and_init() {
+                            Ok(_) => {
+                                let _ = gdb_to_app.send(GDBResponse::Connected);
+                            }
+                            Err(e) => {
+                                let _ = gdb_to_app.send(GDBResponse::Error(e.to_string()));
+                            }
+                        }
+                        continue;
+                    }
+                    GDBConnectResult::Error(e) => {
+                        let _ = gdb_to_app.send(GDBResponse::Error(e.to_string()));
+                        continue;
+                    }
                 }
             }
         }
@@ -110,18 +146,21 @@ pub fn gdb_thread(app_to_gdb: Receiver<GDBCmd>, gdb_to_app: Sender<GDBResponse>)
 
         if is_continue && matches!(response, GDBResponse::Continued) {
             target_running.store(true, Ordering::SeqCst);
-            if let Ok(stream) = gdb.try_clone_stream() {
+            if let Ok(mut gdb_clone) = gdb.try_clone_stream() {
                 let tx = gdb_to_app.clone();
                 let running = target_running.clone();
-                let no_ack = gdb.is_no_ack_mode();
                 std::thread::spawn(move || {
-                    let _ = stream.set_read_timeout(None);
-                    let packet = gdb_client::read_packet_from_stream(&stream, no_ack);
-                    running.store(false, Ordering::SeqCst);
-                    if packet.is_some() {
-                        let _ = tx.send(GDBResponse::Halted);
-                    } else {
-                        let _ = tx.send(GDBResponse::Error("RSP monitor: connection lost".into()));
+                    let packet = gdb_clone.read_packet();
+                    match packet {
+                        Some(_) => {
+                            running.store(false, Ordering::SeqCst);
+                            let _ = tx.send(GDBResponse::Halted);
+                        }
+                        None => {
+                            running.store(false, Ordering::SeqCst);
+                            let _ =
+                                tx.send(GDBResponse::Error("RSP monitor: connection lost".into()));
+                        }
                     }
                 });
             }
@@ -146,8 +185,15 @@ pub fn run_gui(
         options,
         Box::new(|_cc| {
             let (ip, port) = if let Some(storage) = _cc.storage {
-                let ip = storage.get_string("RSPIpAddr").and_then(|string| std::net::Ipv4Addr::from_str(&string).ok()).map(|ip| ip.to_bits().to_be_bytes()).unwrap_or_default();
-                let port = storage.get_string("RSPPort").and_then(|string| u16::from_str(&string).ok()).unwrap_or(2159);
+                let ip = storage
+                    .get_string("RSPIpAddr")
+                    .and_then(|string| std::net::Ipv4Addr::from_str(&string).ok())
+                    .map(|ip| ip.to_bits().to_be_bytes())
+                    .unwrap_or_default();
+                let port = storage
+                    .get_string("RSPPort")
+                    .and_then(|string| u16::from_str(&string).ok())
+                    .unwrap_or(2159);
                 (ip, port)
             } else {
                 ([0u8; 4], 2159)
@@ -159,8 +205,14 @@ pub fn run_gui(
                 ip,
                 connexion: Default::default(),
                 running: false,
-                max_health: 0,
                 error_msg: None,
+                use_serial: false,
+                serial_path: if cfg!(windows) {
+                    "COM1".to_string()
+                } else {
+                    "/dev/ttyUSB0".to_string()
+                },
+                serial_baud: 115200,
             }))
         }),
     );
@@ -180,10 +232,12 @@ struct PenumbraApp {
     port: u16,
     connexion: Connexion,
     running: bool,
-    max_health: u8,
     to_gdb: Sender<GDBCmd>,
     from_gdb: Receiver<GDBResponse>,
     error_msg: Option<String>,
+    use_serial: bool,
+    serial_path: String,
+    serial_baud: u32,
 }
 
 impl PenumbraApp {
@@ -252,31 +306,49 @@ impl eframe::App for PenumbraApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("Penumbra");
 
-            // IP/port entry — disabled when not disconnected
+            // Connection type selector
             ui.add_enabled_ui(self.connexion == Connexion::Disconnected, |ui| {
                 ui.horizontal(|ui| {
-                    let ip_label = ui.label("IP address: ");
-                    let ip_formated = format!(
-                        "{}.{}.{}.{}",
-                        self.ip[0], self.ip[1], self.ip[2], self.ip[3]
-                    );
-                    for byte in self.ip.iter_mut() {
-                        let field = ui.add(egui::DragValue::new(byte));
-                        if field.gained_focus() || field.lost_focus() || field.changed() {
+                    ui.label("Connection: ");
+                    ui.radio_value(&mut self.use_serial, false, "Network");
+                    ui.radio_value(&mut self.use_serial, true, "Serial");
+                });
+            });
+
+            // Connection settings — disabled when not disconnected
+            ui.add_enabled_ui(self.connexion == Connexion::Disconnected, |ui| {
+                if self.use_serial {
+                    ui.horizontal(|ui| {
+                        ui.label("Serial port: ");
+                        ui.text_edit_singleline(&mut self.serial_path);
+                        ui.label("Baud: ");
+                        ui.add(egui::DragValue::new(&mut self.serial_baud).range(300..=921600));
+                    });
+                } else {
+                    ui.horizontal(|ui| {
+                        let ip_label = ui.label("IP address: ");
+                        let ip_formated = format!(
+                            "{}.{}.{}.{}",
+                            self.ip[0], self.ip[1], self.ip[2], self.ip[3]
+                        );
+                        for byte in self.ip.iter_mut() {
+                            let field = ui.add(egui::DragValue::new(byte));
+                            if field.gained_focus() || field.lost_focus() || field.changed() {
+                                if let Some(storage) = frame.storage_mut() {
+                                    storage.set_string("RSPIpAddr", ip_formated.clone());
+                                }
+                            }
+                            field.labelled_by(ip_label.id);
+                        }
+                        ui.label(":");
+                        let port = ui.add(egui::DragValue::new(&mut self.port));
+                        if port.gained_focus() || port.lost_focus() || port.changed() {
                             if let Some(storage) = frame.storage_mut() {
-                                storage.set_string("RSPIpAddr", ip_formated.clone());
+                                storage.set_string("RSPPort", format!("{}", self.port));
                             }
                         }
-                        field.labelled_by(ip_label.id);
-                    }
-                    ui.label(":");
-                    let port = ui.add(egui::DragValue::new(&mut self.port));
-                    if port.gained_focus() || port.lost_focus() || port.changed() {
-                        if let Some(storage) = frame.storage_mut() {
-                            storage.set_string("RSPPort", format!("{}", self.port));
-                        }
-                    }
-                });
+                    });
+                }
             });
 
             // Connect / Disconnect button
@@ -293,11 +365,20 @@ impl eframe::App for PenumbraApp {
                 if self.connexion == Connexion::Disconnected {
                     self.connexion = Connexion::Connecting;
                     self.error_msg = None;
-                    let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(
-                        self.ip[0], self.ip[1], self.ip[2], self.ip[3],
-                    ));
-                    self.send_cmd(GDBCmd::SetSource(GDBSource::Network((ip, self.port))), ctx);
-                    self.send_cmd(GDBCmd::ConnectAndInit, ctx);
+                    let source = if self.use_serial {
+                        GDBSource::Serial {
+                            path: std::path::PathBuf::from(&self.serial_path),
+                            baud_rate: self.serial_baud,
+                        }
+                    } else {
+                        GDBSource::Network((
+                            std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                                self.ip[0], self.ip[1], self.ip[2], self.ip[3],
+                            )),
+                            self.port,
+                        ))
+                    };
+                    self.send_cmd(GDBCmd::ConnectAndInit(source), ctx);
                 } else {
                     self.send_cmd(GDBCmd::Disconnect, ctx);
                 }

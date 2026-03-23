@@ -136,9 +136,7 @@ impl SymbolResolver {
         Ok((context, dwarf, line_index))
     }
 
-    fn build_line_index(
-        dwarf: &gimli::Dwarf<Reader>,
-    ) -> Result<Vec<LineEntry>, gimli::Error> {
+    fn build_line_index(dwarf: &gimli::Dwarf<Reader>) -> Result<Vec<LineEntry>, gimli::Error> {
         let mut entries = Vec::new();
         let mut units = dwarf.units();
 
@@ -343,9 +341,7 @@ impl SymbolResolver {
 
         // Type
         let var_type = match entry.attr_value(gimli::DW_AT_type) {
-            Some(gimli::AttributeValue::UnitRef(offset)) => {
-                Self::resolve_type(unit, dwarf, offset)
-            }
+            Some(gimli::AttributeValue::UnitRef(offset)) => Self::resolve_type(unit, dwarf, offset),
             _ => None,
         }
         .unwrap_or(VarType {
@@ -438,12 +434,10 @@ impl SymbolResolver {
 
 fn attr_to_string(value: &gimli::AttributeValue<Reader>) -> String {
     match value {
-        gimli::AttributeValue::String(s) => {
-            match s.to_slice() {
-                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-                Err(_) => String::new(),
-            }
-        }
+        gimli::AttributeValue::String(s) => match s.to_slice() {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            Err(_) => String::new(),
+        },
         _ => String::new(),
     }
 }
